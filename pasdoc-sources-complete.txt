@@ -1,0 +1,12 @@
+Src\VclRotatedEdit.pas
+Src\VclRotatedEdit_Types.pas
+Src\VclRotatedEdit_Core.pas
+Src\VclRotatedEdit_Geometry.pas
+Src\VclRotatedEdit_Layout.pas
+Src\VclRotatedEdit_Render.pas
+Src\VclRotatedEdit_Style.pas
+Src\VclRotatedEdit_EditEngine.pas
+Src\VclRotatedEdit_Caret.pas
+Src\VclRotatedEdit_Clipboard.pas
+Src\VclRotatedEdit_Design.pas
+Src\VclRotatedEdit_Reg.pas

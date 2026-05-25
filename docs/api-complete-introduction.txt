@@ -1,0 +1,146 @@
+VclRotatedEdit is a single-line VCL edit control that can render and edit text
+horizontally, vertically, or at an arbitrary angle while preserving the behavior
+expected from an edit control:
+
+  - caret movement;
+  - selection;
+  - clipboard operations;
+  - validation;
+  - VCL styles;
+  - design-time resizing.
+
+Copyright (c) 2026 Marc BAUMSTIMLER
+Repository: https://github.com/mbaumsti/VclRotatedEdit
+License: see the LICENSE file.
+
+
+MAIN CONCEPTS
+-------------
+
+The component separates the normal VCL external bounds from the logical edit
+surface used internally by the editor.
+
+  Left, Top, Width, Height
+      Normal external VCL rectangle.
+
+  LogicalLength
+      Logical size along the text flow axis.
+
+  LogicalThickness
+      Logical size perpendicular to the text flow axis.
+
+  Angle
+      Effective rotation angle in degrees.
+
+  Orientation
+      Convenience property for common modes:
+      horizontal, vertical down, vertical up and custom angle.
+
+
+VALIDATED ORIENTATION CONVENTION
+--------------------------------
+
+  reoVerticalDown
+      Visual text flow starts near the top of the control and goes downward.
+      This orientation maps to 270 degrees.
+
+  reoVerticalUp
+      Visual text flow starts near the bottom of the control and goes upward.
+      This orientation maps to 90 degrees.
+
+This convention must remain centralized in the geometry unit so that rendering,
+caret placement, selection, hit-testing and layout all use the same angle.
+
+
+DESIGN-TIME BEHAVIOR
+--------------------
+
+The component intentionally separates the external VCL rectangle from the
+internal editable surface.
+
+Important rules:
+
+  - Loading a DFM preserves the streamed external bounds.
+
+  - Changing LogicalLength or LogicalThickness recalculates the external bounds
+    from the logical edit surface.
+
+  - Changing Angle or Orientation recalculates the external bounds while keeping
+    the external center stable.
+
+  - During a design-time resize drag, only one logical axis changes:
+    either LogicalLength or LogicalThickness, never both.
+
+  - If a design-time resize would produce an invalid or too-small rectangle, the
+    component restores the last valid geometry.
+
+  - During design-time dragging, the control avoids repainting the full parent
+    surface into its own background. This prevents containers such as TGroupBox
+    from leaking their border or caption into the rotated edit background.
+
+
+STYLE SUPPORT
+-------------
+
+The component is owner-drawn and resolves its colors through PaletteMode and
+StyleElements.
+
+  repmStyle
+      Uses the resolved VCL style palette when possible.
+
+  repmCustom
+      Uses component colors such as Color, Font.Color and BorderColor.
+
+StyleElements is honored:
+
+  seClient
+      Style controls the edit background.
+
+  seFont
+      Style controls the text color.
+
+  seBorder
+      Style controls the border color.
+
+
+EDITING API
+-----------
+
+The public API includes common edit-control operations:
+
+  Clear
+      Clears the whole text.
+
+  ClearSelection
+      Removes the current selection without using the clipboard.
+
+  SelectAll
+      Selects the whole text.
+
+  CopyToClipboard
+      Copies the current selection to the clipboard.
+
+  CutToClipboard
+      Cuts the current selection to the clipboard when the control is not
+      read-only.
+
+  PasteFromClipboard
+      Inserts clipboard text at the caret position or replaces the current
+      selection.
+
+  SelText
+      Returns the selected text. Assigning SelText replaces the current
+      selection or inserts text at the current caret position.
+
+
+DOCUMENTATION SCOPE
+-------------------
+
+This documentation covers the component source units only.
+
+It intentionally excludes:
+
+  - demo sources;
+  - Delphi history folders;
+  - backup or copy files;
+  - generated binary files.
