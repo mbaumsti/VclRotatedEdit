@@ -37,7 +37,8 @@ Uses
     Vcl.StdCtrls,
     VclRotatedEdit_Types,
     VclRotatedEdit_Caret,
-    VclRotatedEdit_Style;
+    VclRotatedEdit_Style,
+    VclRotatedEdit_RenderBackend;
 
 Type
     {
@@ -119,6 +120,21 @@ Type
         //-----------------------------------------------------------------
         FLogicalLength:    Integer;
         FLogicalThickness: Integer;
+
+        //-----------------------------------------------------------------
+        //Native-like automatic logical thickness.
+        //
+        //This AutoSize is deliberately about the edit surface thickness, not
+        //about the rotated rectangular host bounds. AutoSizeBounds already owns
+        //the latter concern. When AutoSize is enabled, font/style/border changes
+        //can update LogicalThickness to the preferred single-line edit height.
+        //When AutoSize is disabled, users may reduce LogicalThickness manually;
+        //the layout still receives the preferred height as a reference so the
+        //normal top margin is preserved and the lower part clips like TEdit.
+        //-----------------------------------------------------------------
+        FAutoSize: Boolean;
+        FPreferredLogicalThickness: Integer;
+        FPreferredLogicalThicknessValid: Boolean;
 
         //-----------------------------------------------------------------
         //Automatic physical bounding box management.
@@ -278,6 +294,7 @@ Type
         FClickCount:          Integer;
 
         FCaretController: TRotatedEditCaretController;
+        FRenderBackend: IRotatedEditRenderBackend;
 
         //-----------------------------------------------------------------
         //Cached canonical background.
@@ -370,6 +387,7 @@ Type
         Procedure SetAngle(Const Value: Double);
         Procedure SetLogicalLength(Const Value: Integer);
         Procedure SetLogicalThickness(Const Value: Integer);
+        Procedure SetAutoSize(Const Value: Boolean);
         Procedure SetAutoSizeBounds(Const Value: Boolean);
         Procedure SetReadOnly(Const Value: Boolean);
         Procedure SetMaxLength(Const Value: Integer);
@@ -404,6 +422,9 @@ Type
 
         Procedure InvalidateBackgroundCache;
         Procedure InvalidateContentBitmap;
+        Procedure InvalidatePreferredLogicalThickness;
+        Function ResolvePreferredLogicalThickness: Integer;
+        Procedure ApplyAutoSizeLogicalThickness;
         Procedure UpdatePhysicalBoundsFromLogicalSize;
         Procedure ApplyExternalBoundsFromLogicalSize;
         Procedure ApplyExternalBoundsFromLogicalSizeKeepingCenter;
@@ -704,6 +725,9 @@ Type
         {Rotation angle in degrees. Used directly when Orientation is reoCustomAngle.}
         Property Angle:       Double Read FAngle Write SetAngle;
 
+        {Automatically keeps LogicalThickness at the native-like single-line edit height.}
+        Property AutoSize:    Boolean Read FAutoSize Write SetAutoSize Default True;
+
         {Logical dimension in the text flow direction.}
         Property LogicalLength: Integer Read FLogicalLength Write SetLogicalLength Default 120;
 
@@ -811,7 +835,6 @@ Uses
     Vcl.Themes,
     VclRotatedEdit_Geometry,
     VclRotatedEdit_Layout,
-    VclRotatedEdit_Render,
     VclRotatedEdit_EditEngine,
     VclRotatedEdit_Clipboard;
 
@@ -834,6 +857,9 @@ Begin
 
     FLogicalLength := 120;
     FLogicalThickness := 24;
+    FAutoSize := True;
+    FPreferredLogicalThickness := 0;
+    FPreferredLogicalThicknessValid := False;
     FAutoSizeBounds := True;
     FDesignerResizeGrip := rerzNone;
     FDesignerResizeTargetsLength := True;
@@ -898,6 +924,16 @@ Begin
 
     FCaretController := TRotatedEditCaretController.Create(Self);
     FCaretController.OnCaretChanged := CaretChanged;
+
+    //---------------------------------------------------------------------
+    //Rendering backend.
+    //
+    //The initial backend is deliberately the historical GDI implementation.
+    //The core already talks to it through IRotatedEditRenderBackend so the
+    //future Direct2D/DirectWrite backend can own both drawing and text metrics
+    //without mixing GDI measurements with DirectWrite rendering.
+    //---------------------------------------------------------------------
+    FRenderBackend := TRotatedEditGDIRenderBackend.Create;
 
     FBackgroundBitmap := TBitmap.Create;
     FBackgroundBitmap.PixelFormat := pf32bit;
@@ -2258,14 +2294,28 @@ Begin
 End;
 
 Procedure TRotatedEditCore.SetLogicalThickness(Const Value: Integer);
+Var
+    LLogicalThickness: Integer;
 Begin
-    If FLogicalThickness = Value Then
+    //-------------------------------------------------------------------------
+    //Manual logical-thickness update.
+    //
+    //When AutoSize is enabled, LogicalThickness follows the preferred native-like
+    //single-line edit height, as TEdit does with Height. To test or intentionally
+    //clip a thinner edit band, callers must first set AutoSize to False.
+    //-------------------------------------------------------------------------
+    LLogicalThickness := Value;
+
+    If LLogicalThickness < 1 Then
+        LLogicalThickness := 1;
+
+    If FAutoSize And Not (csLoading In ComponentState) Then
+        LLogicalThickness := ResolvePreferredLogicalThickness;
+
+    If FLogicalThickness = LLogicalThickness Then
         Exit;
 
-    FLogicalThickness := Value;
-
-    If FLogicalThickness < 1 Then
-        FLogicalThickness := 1;
+    FLogicalThickness := LLogicalThickness;
 
     FDesignerResizeGrip := rerzNone;
     FDesignerResizeLastTick := 0;
@@ -2285,6 +2335,34 @@ Begin
 
     ApplyExternalBoundsFromLogicalSize;
     Invalidate;
+End;
+
+
+Procedure TRotatedEditCore.SetAutoSize(Const Value: Boolean);
+Begin
+    //-------------------------------------------------------------------------
+    //Enables or disables native-like automatic logical thickness.
+    //
+    //The property intentionally follows the TEdit name. In this rotated control
+    //it does not mean "resize the rectangular host directly"; it means "keep the
+    //single-line edit surface thickness at the expected native TEdit height for
+    //the current font/border/style". AutoSizeBounds remains responsible for the
+    //external projected Width / Height.
+    //-------------------------------------------------------------------------
+    If FAutoSize = Value Then
+        Exit;
+
+    FAutoSize := Value;
+
+    If csLoading In ComponentState Then
+        Exit;
+
+    If FAutoSize Then
+        ApplyAutoSizeLogicalThickness
+    Else Begin
+        InvalidateContentBitmap;
+        Invalidate;
+    End;
 End;
 
 Procedure TRotatedEditCore.SetAutoSizeBounds(Const Value: Boolean);
@@ -2623,8 +2701,15 @@ Begin
         Exit;
 
     FBorderStyle := Value;
+
+    InvalidatePreferredLogicalThickness;
     InvalidateBackgroundCache;
-    UpdateWindowRegion;
+
+    If FAutoSize Then
+        ApplyAutoSizeLogicalThickness
+    Else
+        UpdateWindowRegion;
+
     Invalidate;
 End;
 
@@ -2668,8 +2753,13 @@ Begin
 
     FPaletteMode := Value;
 
+    InvalidatePreferredLogicalThickness;
     InvalidateBackgroundCache;
     InvalidateContentBitmap;
+
+    If FAutoSize Then
+        ApplyAutoSizeLogicalThickness;
+
     Invalidate;
 End;
 
@@ -2796,6 +2886,135 @@ Begin
     FContentBitmapValid := False;
 End;
 
+
+
+Procedure TRotatedEditCore.InvalidatePreferredLogicalThickness;
+Begin
+    //-------------------------------------------------------------------------
+    //Invalidates the cached native-like single-line edit height.
+    //
+    //The value depends on Font, BorderStyle and the active VCL style. It is not
+    //a paint cache: it is a layout reference used both by AutoSize and by the
+    //"manual thickness smaller than normal" clipping rule.
+    //-------------------------------------------------------------------------
+    FPreferredLogicalThicknessValid := False;
+End;
+
+Function TRotatedEditCore.ResolvePreferredLogicalThickness: Integer;
+Var
+    LEdit: TEdit;
+    LPreferredHeight: Integer;
+Begin
+    //-------------------------------------------------------------------------
+    //Resolves the normal single-line edit height by asking a real VCL TEdit.
+    //
+    //This is intentionally not guessed from tmHeight, TextHeight('Wg') or a
+    //hard-coded padding table. Native/styled TEdit height depends on font
+    //metrics, border style, DPI, active VCL style and parent style context.
+    //
+    //Important rule fixed in increment 117:
+    //The temporary TEdit must be attached to the same parent window/context as
+    //the rotated edit whenever possible. A TEdit created only with
+    //ParentWindow := GetDesktopWindow can report a smaller AutoSize height on
+    //some styled configurations, because it does not resolve the same themed
+    //edit frame/content metrics as a normal TEdit placed on the form. In the
+    //reported case this returned 23 while a real styled TEdit used 25.
+    //
+    //The returned value is a LOGICAL thickness: at Angle = 0 it corresponds to
+    //the normal TEdit outer height, including the edit border. The rotated
+    //physical host bounds are still computed later by
+    //ApplyExternalBoundsFromLogicalSize.
+    //-------------------------------------------------------------------------
+    If FPreferredLogicalThicknessValid Then Begin
+        Result := FPreferredLogicalThickness;
+        Exit;
+    End;
+
+    LPreferredHeight := FLogicalThickness;
+
+    LEdit := TEdit.Create(Nil);
+    Try
+        //---------------------------------------------------------------------
+        //Attach the probe edit to the real parent when available. This makes
+        //the VCL style service, DPI context and non-client/border sizing path
+        //match a normal TEdit on the same form.
+        //
+        //The fallback ParentWindow path is kept only for early construction or
+        //test harnesses where the rotated edit has no parent yet.
+        //---------------------------------------------------------------------
+        LEdit.Visible := False;
+
+        If Parent <> Nil Then
+            LEdit.Parent := Parent
+        Else
+            LEdit.ParentWindow := GetDesktopWindow;
+
+        LEdit.Font.Assign(Font);
+        LEdit.BorderStyle := FBorderStyle;
+        LEdit.StyleElements := StyleElements;
+        LEdit.AutoSize := True;
+
+        //---------------------------------------------------------------------
+        //Force handle creation after all relevant properties have been copied.
+        //The native EDIT/VCL AutoSize logic can then include the actual styled
+        //border and the current parent/DPI context in the returned Height.
+        //---------------------------------------------------------------------
+        LEdit.HandleNeeded;
+        LPreferredHeight := LEdit.Height;
+    Finally
+        LEdit.Free;
+    End;
+
+    If LPreferredHeight < 1 Then
+        LPreferredHeight := FLogicalThickness;
+
+    If LPreferredHeight < 1 Then
+        LPreferredHeight := 1;
+
+    FPreferredLogicalThickness := LPreferredHeight;
+    FPreferredLogicalThicknessValid := True;
+
+    Result := FPreferredLogicalThickness;
+End;
+
+Procedure TRotatedEditCore.ApplyAutoSizeLogicalThickness;
+Var
+    LPreferredThickness: Integer;
+Begin
+    //-------------------------------------------------------------------------
+    //Applies AutoSize to the logical thickness only.
+    //
+    //AutoSizeBounds and AutoSize are deliberately separate:
+    //- AutoSize decides the canonical edit thickness from the current font and
+    //  border, like TEdit does for its Height;
+    //- AutoSizeBounds decides whether the outer rotated VCL rectangle is rebuilt
+    //  from the logical dimensions.
+    //-------------------------------------------------------------------------
+    If Not FAutoSize Then
+        Exit;
+
+    LPreferredThickness := ResolvePreferredLogicalThickness;
+
+    If LPreferredThickness < 1 Then
+        Exit;
+
+    If FLogicalThickness = LPreferredThickness Then
+        Exit;
+
+    FLogicalThickness := LPreferredThickness;
+
+    FDesignerResizeGrip := rerzNone;
+    FDesignerResizeLastTick := 0;
+
+    InvalidateBackgroundCache;
+    InvalidateRotationCenter;
+
+    If csLoading In ComponentState Then
+        Exit;
+
+    ApplyExternalBoundsFromLogicalSize;
+    Invalidate;
+End;
 
 Procedure TRotatedEditCore.CalcProjectedEditBoundsForLogicalSize(
     ALogicalLength: Integer;
@@ -3352,7 +3571,12 @@ Begin
     //The physical window region does not need to be rebuilt because
     //LogicalLength / LogicalThickness remain the explicit edit-surface size.
     //-------------------------------------------------------------------------
+    InvalidatePreferredLogicalThickness;
     InvalidateContentBitmap;
+
+    If FAutoSize Then
+        ApplyAutoSizeLogicalThickness;
+
     Invalidate;
 End;
 
@@ -3367,8 +3591,13 @@ Begin
     //The component uses bitmap caches, so a normal Invalidate is not enough:
     //both canonical caches must be dropped before repaint.
     //-------------------------------------------------------------------------
+    InvalidatePreferredLogicalThickness;
     InvalidateBackgroundCache;
     InvalidateContentBitmap;
+
+    If FAutoSize Then
+        ApplyAutoSizeLogicalThickness;
+
     Invalidate;
 End;
 
@@ -3878,7 +4107,7 @@ Begin
 
     LLayout := BuildCurrentLayout;
 
-    LHit := TRotatedEditLayout.HitTest(
+    LHit := FRenderBackend.HitTest(
         Canvas,
         LLayout,
         LPoint);
@@ -4101,8 +4330,12 @@ Begin
     FDesignerResizeGrip := rerzNone;
     FDesignerResizeLastTick := 0;
     InvalidateRotationCenter;
+    InvalidatePreferredLogicalThickness;
 
-    UpdateWindowRegion;
+    If FAutoSize Then
+        ApplyAutoSizeLogicalThickness
+    Else
+        UpdateWindowRegion;
 End;
 
 Procedure TRotatedEditCore.PaintTransparentBackground;
@@ -4422,7 +4655,7 @@ Begin
     //surface, then projects it. There is no transparent color key, so the old
     //clFuchsia artifact cannot appear.
     //---------------------------------------------------------------------
-    TRotatedEditRenderer.DrawContent(
+    FRenderBackend.DrawContent(
         Canvas,
         LLayout,
         LColors,
@@ -4439,7 +4672,7 @@ Begin
     //The caret stays outside the content bitmap. Its blink only invalidates the
     //control paint, not the cached background/content surfaces.
     //---------------------------------------------------------------------
-    TRotatedEditRenderer.DrawCaret(
+    FRenderBackend.DrawCaret(
         Canvas,
         LLayout,
         LColors,
@@ -4471,7 +4704,26 @@ Begin
     LInput.ClientRect := ClientRect;
     LInput.LogicalLength := FLogicalLength;
     LInput.LogicalThickness := FLogicalThickness;
+    LInput.PreferredLogicalThickness := ResolvePreferredLogicalThickness;
+    //-------------------------------------------------------------------------
+    //Border metrics rule.
+    //
+    //Do not model the edit frame as a hard-coded 1-pixel inset here. The active
+    //VCL style may draw a normal TEdit with a 2-pixel frame, and the content
+    //rectangle can be asymmetric. The layout must use the same inner rectangle
+    //as the renderer so text, caret, selection and hit-testing stay aligned.
+    //
+    //BorderWidth is kept as a legacy scalar fallback for code that still reads
+    //the input record. New layout code uses BorderMetrics.
+    //-------------------------------------------------------------------------
     LInput.BorderWidth := Ord(FBorderStyle = bsSingle);
+    LInput.BorderMetrics := TRotatedEditStyle.ResolveBorderMetrics(
+        Canvas,
+        Self,
+        FPaletteMode = repmStyle,
+        StyleName,
+        StyleElements,
+        FBorderStyle);
     LInput.PaddingLeft := FPaddingLeft;
 
     //---------------------------------------------------------------------
@@ -4497,7 +4749,7 @@ Begin
     LInput.CustomActualOriginX := FInternalOriginX;
     LInput.CustomActualOriginY := FInternalOriginY;
 
-    Result := TRotatedEditLayout.BuildLayout(
+    Result := FRenderBackend.BuildLayout(
         Canvas,
         LInput);
 
@@ -5036,7 +5288,7 @@ Begin
 
     LLayout := BuildCurrentLayout;
 
-    LHit := TRotatedEditLayout.HitTest(
+    LHit := FRenderBackend.HitTest(
         Canvas,
         LLayout,
         Point(X, Y));
@@ -5138,7 +5390,7 @@ Begin
     //-------------------------------------------------------------------------
     LLayout := BuildCurrentLayout;
 
-    LHit := TRotatedEditLayout.HitTest(
+    LHit := FRenderBackend.HitTest(
         Canvas,
         LLayout,
         Point(X, Y));
@@ -5217,7 +5469,7 @@ Begin
 
     LLayout := BuildCurrentLayout;
 
-    LHit := TRotatedEditLayout.HitTest(
+    LHit := FRenderBackend.HitTest(
         Canvas,
         LLayout,
         LPoint);
@@ -5514,7 +5766,7 @@ Initialization
     //
     //TRotatedEditCore remains fully owner-drawn: the hook is not expected to
     //paint the rotated edit surface. The visual result still comes from Paint,
-    //TRotatedEditStyle and TRotatedEditRenderer.
+    //TRotatedEditStyle and the active render backend.
     //
     //The hook is kept as a compatibility/integration aid so the VCL style
     //engine can treat the control as style-aware. v77 deliberately uses the

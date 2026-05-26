@@ -27,14 +27,18 @@ The component is designed for VCL applications that need editable labels, compac
 - Horizontal, vertical-down, vertical-up and custom-angle orientations.
 - Arbitrary angle rendering through the `Angle` property.
 - Stable logical dimensions through `LogicalLength` and `LogicalThickness`.
+- Native-like `AutoSize` support for the logical thickness of a single-line edit surface.
 - Caret, selection and mouse hit-testing aligned with the rotated text flow.
 - Clipboard and selection support: copy, cut, paste, select all, selected-text replacement and clear selection.
 - `ReadOnly`, `MaxLength`, `CharCase`, `NumbersOnly`, `TextHint` and alignment support.
 - VCL style-aware rendering through `PaletteMode` and `StyleElements`.
+- Style-derived border metrics so the editable area follows the active VCL style instead of assuming a fixed one-pixel border.
 - Design-time selection markers for shaped/rotated controls.
 - Protected design-time resizing: one drag changes either logical length or logical thickness, never both.
 - Protection against invalid design-time resize rectangles.
 - Design-time drag repaint protection over container controls such as `TGroupBox`.
+- GDI fallback renderer corrected for arbitrary-angle text rendering without rotating ClearType-rasterized text bitmaps.
+- Rendering backend boundary prepared so a future Direct2D/DirectWrite backend can own both rendering and text metrics.
 - Event set close to what developers expect from an edit control, plus specific editing events.
 
 ---
@@ -53,6 +57,17 @@ The component is designed for VCL applications that need editable labels, compac
 - `LogicalThickness`: dimension perpendicular to the text flow axis.
 
 For a rotated control, `Width` and `Height` are not the editable dimensions. They are only the external box that contains the rotated logical edit surface.
+
+### AutoSize and logical thickness
+
+`AutoSize` follows the naming convention of `TEdit`, but it acts on the logical edit surface.
+
+- When `AutoSize = True`, the component updates `LogicalThickness` to a native-like single-line edit height for the current font, style and border.
+- When `AutoSize = False`, the user may set a smaller or larger `LogicalThickness`.
+- If the logical thickness is smaller than the native-like value, the normal top margin is preserved and the lower part is clipped, matching the behavior expected from a single-line edit control.
+- If the logical thickness is larger than the native-like value, the text band is visually re-centered inside the enlarged editable area.
+
+Text vertical placement is intentionally based on the visible `W` glyph band for better visual centering, while caret, selection and hit-testing remain aligned through the same layout result.
 
 ### Orientation and angle
 
@@ -133,6 +148,7 @@ Rotated-edit specific properties:
 - `Angle`
 - `LogicalLength`
 - `LogicalThickness`
+- `AutoSize`: automatically maintains a native-like logical thickness for the current font/style.
 - `AutoSizeBounds`
 - `PaletteMode`
 - `ShowDesignMarkers`
@@ -145,7 +161,7 @@ Runtime selection state:
 - `SelText`: selected text. Assigning this property replaces the current selection or inserts text at the caret position.
 - `ScrollOffset`
 
-`Cursor` is intentionally not published because the component uses an orientation-aware custom hover cursor.
+`Cursor` is intentionally hidden from the Object Inspector because the component uses an orientation-aware custom hover cursor. The inherited runtime property still exists as part of `TControl`, but it is not a meaningful design-time setting for `TRotatedEdit`.
 
 ---
 
@@ -261,8 +277,9 @@ end;
 - `VclRotatedEdit_Types.pas`: shared types and event signatures.
 - `VclRotatedEdit_Geometry.pas`: projection and angle helpers.
 - `VclRotatedEdit_Layout.pas`: canonical text/caret/selection layout.
-- `VclRotatedEdit_Render.pas`: owner-drawn rendering pipeline.
-- `VclRotatedEdit_Style.pas`: style and color resolution.
+- `VclRotatedEdit_Render.pas`: historical GDI owner-drawn rendering pipeline.
+- `VclRotatedEdit_RenderBackend.pas`: rendering and text-metric backend contract, currently implemented by the GDI backend and prepared for Direct2D/DirectWrite.
+- `VclRotatedEdit_Style.pas`: style, color and border-metric resolution.
 - `VclRotatedEdit_EditEngine.pas`: pure text mutation engine.
 - `VclRotatedEdit_Caret.pas`: caret blink controller.
 - `VclRotatedEdit_Clipboard.pas`: clipboard helpers.
@@ -307,6 +324,20 @@ The configuration intentionally documents only the public component sources from
 - generated binary files from `Lib`.
 
 If your PasDoc version does not support `@` response files, use the fallback command documented in `pasdoc.txt`.
+
+---
+
+## Recent changes in increment 118
+
+This increment is intended as a corrective release before the Direct2D/DirectWrite work continues.
+
+- Kept the validated GDI arbitrary-angle text fix: text is no longer rendered as ClearType into a horizontal bitmap and then rotated.
+- Kept the style-aware border metric fix: layout now uses the real VCL-style edit content margins instead of assuming a fixed one-pixel border.
+- Kept the visual text-centering fix based on the visible `W` glyph band.
+- Kept the validated `AutoSize` behavior for `LogicalThickness`, using a native `TEdit` probe in the same parent/style context.
+- Added design-time hiding of the inherited `Cursor` property with `UnlistPublishedProperty`, because the component manages its own orientation-aware cursor.
+- Updated PasDoc support files so `VclRotatedEdit_RenderBackend.pas` is included in the generated API documentation.
+- Updated README/API documentation notes to describe `AutoSize`, backend separation, style border metrics and the hidden `Cursor` design-time property.
 
 ---
 

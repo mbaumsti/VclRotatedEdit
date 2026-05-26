@@ -42,6 +42,7 @@ contains
   VclRotatedEdit_Render in '..\Src\VclRotatedEdit_Render.pas',
   VclRotatedEdit_Caret in '..\Src\VclRotatedEdit_Caret.pas',
   VclRotatedEdit_Clipboard in '..\Src\VclRotatedEdit_Clipboard.pas',
-  VclRotatedEdit_Style in '..\Src\VclRotatedEdit_Style.pas';
+  VclRotatedEdit_Style in '..\Src\VclRotatedEdit_Style.pas',
+  VclRotatedEdit_RenderBackend in '..\Src\VclRotatedEdit_RenderBackend.pas';
 
 End.

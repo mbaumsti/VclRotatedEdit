@@ -7,7 +7,10 @@ expected from an edit control:
   - clipboard operations;
   - validation;
   - VCL styles;
-  - design-time resizing.
+  - design-time resizing;
+  - native-like logical AutoSize behavior;
+  - style-aware border metrics;
+  - backend separation for future Direct2D/DirectWrite rendering.
 
 Copyright (c) 2026 Marc BAUMSTIMLER
 Repository: https://github.com/mbaumsti/VclRotatedEdit
@@ -51,6 +54,21 @@ VALIDATED ORIENTATION CONVENTION
 This convention must remain centralized in the geometry unit so that rendering,
 caret placement, selection, hit-testing and layout all use the same angle.
 
+
+AUTOSIZE AND LOGICAL THICKNESS
+------------------------------
+
+AutoSize uses the familiar TEdit name, but it updates LogicalThickness rather
+than treating Width and Height as the edit surface.
+
+When AutoSize is enabled, LogicalThickness is resolved from a native TEdit probe
+created in the same parent/style context. This keeps the logical edit height
+close to the current VCL style, font and border settings.
+
+When AutoSize is disabled and LogicalThickness is reduced below the preferred
+value, the layout keeps the normal top margin and lets the lower part clip, as
+a native single-line edit does. When LogicalThickness is enlarged, the visual
+text band is centered in the enlarged editable area.
 
 DESIGN-TIME BEHAVIOR
 --------------------
@@ -103,6 +121,16 @@ StyleElements is honored:
       Style controls the border color.
 
 
+RENDERING BACKEND BOUNDARY
+--------------------------
+
+Rendering and text-metric dependent operations pass through
+IRotatedEditRenderBackend. The current implementation is the historical GDI
+backend. The contract deliberately includes layout and hit-testing, not only
+drawing, so a future Direct2D/DirectWrite backend can compute text positions,
+caret placement and selection geometry with the same engine that renders the
+text.
+
 EDITING API
 -----------
 
@@ -132,6 +160,16 @@ The public API includes common edit-control operations:
       Returns the selected text. Assigning SelText replaces the current
       selection or inserts text at the current caret position.
 
+
+
+
+DESIGN-TIME CURSOR PROPERTY
+---------------------------
+
+The inherited Cursor property is hidden from the Object Inspector by the
+design-time registration unit. TRotatedEdit manages its own orientation-aware
+I-beam cursor, so a fixed design-time Cursor value would be misleading. The
+inherited runtime property still exists because it belongs to TControl.
 
 DOCUMENTATION SCOPE
 -------------------

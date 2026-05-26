@@ -40,7 +40,19 @@ Type
         LogicalLength: Integer;
         LogicalThickness: Integer;
 
+        //-----------------------------------------------------------------
+        //Preferred logical thickness used as the normal single-line edit
+        //height reference. It is intentionally distinct from
+        //LogicalThickness: callers may reduce LogicalThickness manually, in
+        //which case the layout keeps the normal top margin and clips the
+        //overflow at the bottom, like a native TEdit. If LogicalThickness is
+        //larger than this value, the text is centered again in the enlarged
+        //band. Zero means "use LogicalThickness as the reference".
+        //-----------------------------------------------------------------
+        PreferredLogicalThickness: Integer;
+
         BorderWidth: Integer;
+        BorderMetrics: TRotatedEditBorderMetrics;
         PaddingLeft: Integer;
         PaddingTop: Integer;
         PaddingRight: Integer;
@@ -91,6 +103,11 @@ Type
         Class Function GetAdvanceAtIndex(
             Const AAdvances: TArray<Integer>;
             AIndex: Integer): Integer; Static;
+
+        Class Function MeasureRepresentativeGlyphBand(
+            ACanvas: TCanvas;
+            Out AVisualTopInCell: Integer;
+            Out AVisualHeight: Integer): Boolean; Static;
 
     public
         {
@@ -340,6 +357,98 @@ End;
 
 
 
+Class Function TRotatedEditLayout.MeasureRepresentativeGlyphBand(
+    ACanvas: TCanvas;
+    Out AVisualTopInCell: Integer;
+    Out AVisualHeight: Integer): Boolean;
+Var
+    LGlyphMetrics: TGlyphMetrics;
+    LMatrix:       TMat2;
+    LTextMetric:   TTextMetric;
+    LGlyphResult:  DWORD;
+Begin
+    //-------------------------------------------------------------------------
+    //Measures the visible black box of the representative uppercase glyph used
+    //for vertical visual centering.
+    //
+    //Why 'W' and not 'Wg'
+    //--------------------
+    //A single-line edit control is perceived as centered mostly from the main
+    //uppercase/lowercase body of the font. Including a descender sample such as
+    //'g' in the centering metric increases the measured band and can shift the
+    //visible text away from what a native TEdit appears to do.
+    //
+    //Why GetGlyphOutline
+    //-------------------
+    //TCanvas.TextHeight and GetTextExtentPoint32 usually describe the complete
+    //font cell, not the actual ink/black-box height of a specific glyph.
+    //GetGlyphOutline(GGO_METRICS) gives the glyph black box and its origin from
+    //the baseline, which lets the layout compute the corresponding font-cell
+    //top without guessing.
+    //
+    //Returned coordinates
+    //--------------------
+    //AVisualTopInCell is relative to the top of the GDI font cell. The renderer
+    //uses TA_BASELINE with baseline = TextOriginCanonical.Y + tmAscent, so the
+    //visible glyph top is:
+    //
+    //  TextOriginCanonical.Y + AVisualTopInCell
+    //
+    //This keeps layout and renderer synchronized without introducing a local
+    //renderer correction.
+    //-------------------------------------------------------------------------
+    Result := False;
+    AVisualTopInCell := 0;
+    AVisualHeight := 0;
+
+    If ACanvas = Nil Then
+        Exit;
+
+    If Not GetTextMetrics(ACanvas.Handle, LTextMetric) Then
+        Exit;
+
+    FillChar(
+        LMatrix,
+        SizeOf(LMatrix),
+        0);
+
+    LMatrix.eM11.value := 1;
+    LMatrix.eM11.fract := 0;
+    LMatrix.eM12.value := 0;
+    LMatrix.eM12.fract := 0;
+    LMatrix.eM21.value := 0;
+    LMatrix.eM21.fract := 0;
+    LMatrix.eM22.value := 1;
+    LMatrix.eM22.fract := 0;
+
+    FillChar(
+        LGlyphMetrics,
+        SizeOf(LGlyphMetrics),
+        0);
+
+    LGlyphResult := GetGlyphOutline(
+        ACanvas.Handle,
+        Ord('W'),
+        GGO_METRICS,
+        LGlyphMetrics,
+        0,
+        Nil,
+        LMatrix);
+
+    If LGlyphResult = GDI_ERROR Then
+        Exit;
+
+    If LGlyphMetrics.gmBlackBoxY <= 0 Then
+        Exit;
+
+    AVisualHeight := LGlyphMetrics.gmBlackBoxY;
+    AVisualTopInCell := LTextMetric.tmAscent - LGlyphMetrics.gmptGlyphOrigin.y;
+
+    Result := True;
+End;
+
+
+
 Class Function TRotatedEditLayout.GetAdvanceAtIndex(
     Const AAdvances: TArray<Integer>;
     AIndex: Integer): Integer;
@@ -380,10 +489,22 @@ Class Function TRotatedEditLayout.BuildLayout(
     ACanvas: TCanvas;
     Const AInput: TRotatedEditLayoutInput): TRotatedEditLayoutResult;
 Var
-    LLogicalLength:    Integer;
-    LLogicalThickness: Integer;
-    LContentWidth:     Integer;
-    LTextOriginX:      Double;
+    LLogicalLength:              Integer;
+    LLogicalThickness:           Integer;
+    LContentWidth:               Integer;
+    LTextOriginX:                Double;
+    LTextOriginY:                Double;
+    LTextMetric:                 TTextMetric;
+    LTextThickness:              Integer;
+    LRemainingCrossSpace:        Integer;
+    LTopCrossPadding:            Integer;
+    LVisualTopInCell:            Integer;
+    LVisualHeight:               Integer;
+    LVisualRemainingCrossSpace:  Integer;
+    LVisualTopCrossPadding:      Integer;
+    LReferenceLogicalThickness:  Integer;
+    LReferenceContentHeight:     Integer;
+    LBorderMetrics:              TRotatedEditBorderMetrics;
 Begin
     LLogicalLength := AInput.LogicalLength;
     LLogicalThickness := AInput.LogicalThickness;
@@ -404,11 +525,43 @@ Begin
         LLogicalLength,
         LLogicalThickness);
 
+    LBorderMetrics := AInput.BorderMetrics;
+
+    If (LBorderMetrics.Left = 0) And
+       (LBorderMetrics.Top = 0) And
+       (LBorderMetrics.Right = 0) And
+       (LBorderMetrics.Bottom = 0) And
+       (AInput.BorderWidth > 0) Then Begin
+        //---------------------------------------------------------------------
+        //Compatibility fallback.
+        //
+        //The Core now supplies BorderMetrics explicitly. This fallback keeps the
+        //layout deterministic if a test harness or old caller still fills only
+        //the historical scalar BorderWidth field.
+        //---------------------------------------------------------------------
+        LBorderMetrics.Left := AInput.BorderWidth;
+        LBorderMetrics.Top := AInput.BorderWidth;
+        LBorderMetrics.Right := AInput.BorderWidth;
+        LBorderMetrics.Bottom := AInput.BorderWidth;
+    End;
+
+    //-------------------------------------------------------------------------
+    //Resolved content rectangle rule.
+    //
+    //BorderMetrics must come from the active rendering/style backend. A styled
+    //TEdit frame is not necessarily a 1-pixel rectangle: many VCL styles return
+    //2-pixel top/bottom content margins, and some styles can be asymmetric.
+    //
+    //Using these metrics here keeps text, caret, selection and hit-testing in
+    //the same inner area as the frame actually drawn by the renderer. This is
+    //intentionally not corrected in DrawText: local renderer offsets would make
+    //the caret and mouse hit-test drift away from the text.
+    //-------------------------------------------------------------------------
     Result.CanonicalContentRect := Rect(
-        AInput.BorderWidth + AInput.PaddingLeft,
-        AInput.BorderWidth + AInput.PaddingTop,
-        LLogicalLength - AInput.BorderWidth - AInput.PaddingRight,
-        LLogicalThickness - AInput.BorderWidth - AInput.PaddingBottom);
+        LBorderMetrics.Left + AInput.PaddingLeft,
+        LBorderMetrics.Top + AInput.PaddingTop,
+        LLogicalLength - LBorderMetrics.Right - AInput.PaddingRight,
+        LLogicalThickness - LBorderMetrics.Bottom - AInput.PaddingBottom);
 
     If Result.CanonicalContentRect.Right < Result.CanonicalContentRect.Left Then
         Result.CanonicalContentRect.Right := Result.CanonicalContentRect.Left;
@@ -424,7 +577,78 @@ Begin
     //-------------------------------------------------------------------------
     Result.TextLength := Round(TextIndexToCanonicalFlow(ACanvas, AInput.Text, Length(AInput.Text)));
 
-    Result.TextThickness := ACanvas.TextHeight('Wg');
+    //-------------------------------------------------------------------------
+    //GDI text metric rule.
+    //
+    //Two different notions are deliberately kept separate here:
+    //
+    //- TextThickness keeps the complete GDI font cell height. It is the safe
+    //  metric for caret height and for hit-testing because it includes the
+    //  ascender/descender area that GDI may use when TextOut renders arbitrary
+    //  characters.
+    //
+    //- Vertical centering is resolved from the visible black box of a
+    //  representative uppercase glyph, currently 'W'. A native single-line
+    //  TEdit visually appears to center the main uppercase glyph body rather
+    //  than the full "Wg" cell including descender space. Centering on "Wg"
+    //  therefore leaves the text visually too high or too low depending on the
+    //  rounding and on the selected style.
+    //
+    //The renderer still receives a normal canonical TextOriginCanonical.Y. It
+    //adds tmAscent and uses TA_BASELINE. Therefore the layout computes the font
+    //cell top that makes the representative glyph black box centered inside
+    //CanonicalContentRect. No renderer-side magic pixel is required.
+    //
+    //A future DirectWrite backend must implement the same semantic rule with
+    //DirectWrite glyph/run metrics instead of reusing these GDI measurements.
+    //-------------------------------------------------------------------------
+    If GetTextMetrics(ACanvas.Handle, LTextMetric) Then
+        LTextThickness := LTextMetric.tmHeight
+    Else
+        LTextThickness := ACanvas.TextHeight('Wg');
+
+    If LTextThickness < 1 Then
+        LTextThickness := 1;
+
+    Result.TextThickness := LTextThickness;
+
+    //-------------------------------------------------------------------------
+    //Normal cross-axis reference height.
+    //
+    //LogicalThickness remains the user-selected edit-surface thickness. The
+    //preferred thickness is the native/edit-like height expected for the current
+    //font and border. It is used only as a vertical placement reference:
+    //
+    //- if the user reduces LogicalThickness below the preferred value, the text
+    //  keeps the same top margin it would have had in the normal edit height;
+    //  the lower part is clipped by the content rectangle, matching the native
+    //  TEdit behavior where text is not compressed;
+    //
+    //- if the user increases LogicalThickness, the current content height is
+    //  used and the text is centered in the enlarged band. This intentionally
+    //  differs from TEdit, whose top margin tends to remain fixed.
+    //-------------------------------------------------------------------------
+    LReferenceLogicalThickness := AInput.PreferredLogicalThickness;
+
+    If LReferenceLogicalThickness < 1 Then
+        LReferenceLogicalThickness := LLogicalThickness;
+
+    If LReferenceLogicalThickness < LLogicalThickness Then
+        LReferenceLogicalThickness := LLogicalThickness;
+
+    LReferenceContentHeight :=
+        LReferenceLogicalThickness -
+        LBorderMetrics.Top -
+        LBorderMetrics.Bottom -
+        AInput.PaddingTop -
+        AInput.PaddingBottom;
+
+    If LReferenceContentHeight < Result.CanonicalContentRect.Height Then
+        LReferenceContentHeight := Result.CanonicalContentRect.Height;
+
+    If LReferenceContentHeight < 0 Then
+        LReferenceContentHeight := 0;
+
     Result.Angle := AInput.Angle;
 
     If AInput.UseCustomActualOrigin Then
@@ -498,9 +722,56 @@ Begin
     End Else
         LTextOriginX := Result.CanonicalContentRect.Left - Result.ScrollOffset;
 
+    LRemainingCrossSpace := LReferenceContentHeight - Result.TextThickness;
+
+    If LRemainingCrossSpace < 0 Then
+        LRemainingCrossSpace := 0;
+
+    LTopCrossPadding := LRemainingCrossSpace Div 2;
+
+    If MeasureRepresentativeGlyphBand(
+        ACanvas,
+        LVisualTopInCell,
+        LVisualHeight) Then Begin
+        //---------------------------------------------------------------------
+        //Visible-glyph centering rule.
+        //
+        //The glyph black box is expressed relative to the font cell top:
+        //
+        //  visual top in cell = tmAscent - glyph origin Y
+        //
+        //We first center that visible black box inside the content rectangle,
+        //then derive the font cell top needed by the baseline renderer. If the
+        //remaining visual space is odd, integer division assigns the extra
+        //pixel to the bottom side, which is the rounding behavior observed on
+        //the native styled TEdit in the reference tests.
+        //---------------------------------------------------------------------
+        LVisualRemainingCrossSpace := LReferenceContentHeight - LVisualHeight;
+
+        If LVisualRemainingCrossSpace < 0 Then
+            LVisualRemainingCrossSpace := 0;
+
+        LVisualTopCrossPadding := LVisualRemainingCrossSpace Div 2;
+
+        LTextOriginY :=
+            Result.CanonicalContentRect.Top +
+            LVisualTopCrossPadding -
+            LVisualTopInCell;
+    End Else Begin
+        //---------------------------------------------------------------------
+        //Deterministic fallback.
+        //
+        //If GetGlyphOutline is not available for the current font, keep the
+        //previous complete-cell centering rule. This is still coherent for
+        //caret, selection and hit-testing, even if it may be less visually close
+        //to a native TEdit for some styled fonts.
+        //---------------------------------------------------------------------
+        LTextOriginY := Result.CanonicalContentRect.Top + LTopCrossPadding;
+    End;
+
     Result.TextOriginCanonical := TRotatedEditFloatPoint.Create(
         LTextOriginX,
-        Result.CanonicalContentRect.Top + ((Result.CanonicalContentRect.Height - Result.TextThickness) / 2.0));
+        LTextOriginY);
 
     Result.TextOriginActual := TRotatedEditGeometry.TransformPoint(
         Result.TextOriginCanonical,

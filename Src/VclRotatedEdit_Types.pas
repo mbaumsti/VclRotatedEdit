@@ -1,4 +1,4 @@
-﻿Unit VclRotatedEdit_Types;
+Unit VclRotatedEdit_Types;
 
 
 {
@@ -91,6 +91,25 @@ Type
         P2: TRotatedEditFloatPoint;
         P3: TRotatedEditFloatPoint;
         P4: TRotatedEditFloatPoint;
+    End;
+
+    {
+      Resolved edit-frame metrics in canonical coordinates.
+
+      These values describe the real visual/content inset of the editable
+      surface, not an arbitrary owner-drawn pen width. They are deliberately
+      asymmetric because VCL styles can return content rectangles where the top,
+      bottom, left and right insets are not identical.
+
+      The layout engine uses these metrics to build CanonicalContentRect. The
+      renderer must then draw the frame according to the same style contract,
+      without inventing another implicit 1-pixel border model.
+    }
+    TRotatedEditBorderMetrics = Record
+        Left: Integer;
+        Top: Integer;
+        Right: Integer;
+        Bottom: Integer;
     End;
 
     {

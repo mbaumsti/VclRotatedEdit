@@ -7,7 +7,7 @@ Unit VclRotatedEdit_Render;
   VclRotatedEdit
   Copyright (c) 2026 Marc BAUMSTIMLER
 
-  Rendering support layer of the VclRotatedEdit VCL component.
+  Historical GDI rendering support layer of the VclRotatedEdit VCL component.
 
   Repository:
   https://github.com/mbaumsti/VclRotatedEdit
@@ -17,9 +17,9 @@ Unit VclRotatedEdit_Render;
 
   ------------------------------------------------------------------------------
 
-  Couche de support du rendu du composant VCL VclRotatedEdit.
+  Couche de support du rendu GDI historique du composant VCL VclRotatedEdit.
 
-  Cette unité dessine le fond, la bordure, le texte, la sélection et le caret à partir du layout résolu. Elle ne décide jamais de l’index du caret, de la sélection ou de la logique d’édition.
+  Cette unité dessine le fond, la bordure, le texte, la sélection et le caret à partir du layout résolu en utilisant le pipeline GDI historique. Elle est désormais appelée uniquement par le backend GDI.
 }
 
 Interface
@@ -31,10 +31,11 @@ Uses
     Vcl.Graphics,
     Vcl.Themes,
     VclRotatedEdit_Types,
+    VclRotatedEdit_Layout,
     VclRotatedEdit_Style;
 
 Type
-    TRotatedEditRenderer = Class
+    TRotatedEditGDIRenderer = Class
     private
         Class Procedure PrepareBackgroundBitmap(
             ABitmap: TBitmap;
@@ -52,6 +53,11 @@ Type
             Const ASavedXForm: TXForm;
             ASavedGraphicsMode: Integer); Static;
 
+        Class Procedure DrawProjectedBitmap(
+            ACanvas: TCanvas;
+            Const ALayout: TRotatedEditLayoutResult;
+            ABitmap: TBitmap); Static;
+
         Class Function CreateEditSurfaceRegion(
             Const ALayout: TRotatedEditLayoutResult): HRGN; Static;
 
@@ -62,6 +68,22 @@ Type
         Class Function ComputeCanonicalTextY(
             ACanvas: TCanvas;
             Const ALayout: TRotatedEditLayoutResult): Integer; Static;
+
+        Class Function IsOrthogonalAngle(
+            AAngle: Double): Boolean; Static;
+
+        Class Function CreateRotationSafeFont(
+            ACanvas: TCanvas;
+            Const ALayout: TRotatedEditLayoutResult): HFONT; Static;
+
+        Class Function CreateContentClipRegion(
+            Const ALayout: TRotatedEditLayoutResult): HRGN; Static;
+
+        Class Procedure DrawTextDirectOnFinalCanvas(
+            ACanvas: TCanvas;
+            Const ALayout: TRotatedEditLayoutResult;
+            Const AColors: TRotatedEditStyleColors;
+            Const ATextHint: String); Static;
 
         Class Procedure DrawSelectionOnCanonicalCanvas(
             ACanvas: TCanvas;
@@ -109,6 +131,17 @@ Type
             ACaretVisible: Boolean); Static;
     End;
 
+    {
+      Backward-compatible public type name.
+
+      The backend refactor briefly renamed the historical renderer helper from
+      TRotatedEditRenderer to TRotatedEditGDIRenderer. That rename is not worth
+      the package/DCU/build-path fragility it introduces during a corrective
+      release. Keeping this alias lets both names resolve while the source base
+      is being stabilized.
+    }
+    TRotatedEditRenderer = TRotatedEditGDIRenderer;
+
 Implementation
 
 Uses
@@ -116,7 +149,7 @@ Uses
 
 
 
-Class Procedure TRotatedEditRenderer.PrepareBackgroundBitmap(
+Class Procedure TRotatedEditGDIRenderer.PrepareBackgroundBitmap(
     ABitmap: TBitmap;
     Const ALayout: TRotatedEditLayoutResult;
     Const AColors: TRotatedEditStyleColors);
@@ -251,7 +284,7 @@ Begin
     End;
 End;
 
-Class Procedure TRotatedEditRenderer.BeginWorldTransform(
+Class Procedure TRotatedEditGDIRenderer.BeginWorldTransform(
     ACanvas: TCanvas;
     Const ALayout: TRotatedEditLayoutResult;
     Out ASavedXForm: TXForm;
@@ -296,7 +329,7 @@ Begin
         LXForm);
 End;
 
-Class Procedure TRotatedEditRenderer.EndWorldTransform(
+Class Procedure TRotatedEditGDIRenderer.EndWorldTransform(
     ACanvas: TCanvas;
     Const ASavedXForm: TXForm;
     ASavedGraphicsMode: Integer);
@@ -311,7 +344,80 @@ Begin
 End;
 
 
-Class Function TRotatedEditRenderer.CreateEditSurfaceRegion(
+Class Procedure TRotatedEditGDIRenderer.DrawProjectedBitmap(
+    ACanvas: TCanvas;
+    Const ALayout: TRotatedEditLayoutResult;
+    ABitmap: TBitmap);
+Var
+    LDestPoints: Array [0 .. 2] Of TPoint;
+    LOldStretchMode: Integer;
+Begin
+    //-------------------------------------------------------------------------
+    //Projects a canonical bitmap onto the actual rotated edit parallelogram.
+    //
+    //Important GDI fallback rule:
+    //Do not draw cached bitmaps through SetWorldTransform + TCanvas.Draw. That
+    //path eventually relies on BitBlt-like raster operations whose behavior is
+    //driver-dependent for rotations and shears. Around shallow arbitrary angles
+    //(for example 10/11 degrees), it can produce corrupted or apparently random
+    //pixels although the canonical bitmap itself is valid.
+    //
+    //PlgBlt is the GDI API designed to copy a rectangular source bitmap into an
+    //arbitrary destination parallelogram. The three destination points are:
+    //- upper-left  = canonical P1 projected to actual coordinates;
+    //- upper-right = canonical P2 projected to actual coordinates;
+    //- lower-left  = canonical P4 projected to actual coordinates.
+    //
+    //The source bitmap is intentionally opaque, so no mask is supplied.
+    //-------------------------------------------------------------------------
+    If ABitmap = Nil Then
+        Exit;
+
+    If (ABitmap.Width <= 0) Or (ABitmap.Height <= 0) Then
+        Exit;
+
+    LDestPoints[0] := Point(
+        Round(ALayout.ActualEditQuad.P1.X),
+        Round(ALayout.ActualEditQuad.P1.Y));
+
+    LDestPoints[1] := Point(
+        Round(ALayout.ActualEditQuad.P2.X),
+        Round(ALayout.ActualEditQuad.P2.Y));
+
+    LDestPoints[2] := Point(
+        Round(ALayout.ActualEditQuad.P4.X),
+        Round(ALayout.ActualEditQuad.P4.Y));
+
+    LOldStretchMode := SetStretchBltMode(
+        ACanvas.Handle,
+        HALFTONE);
+    Try
+        SetBrushOrgEx(
+            ACanvas.Handle,
+            0,
+            0,
+            Nil);
+
+        PlgBlt(
+            ACanvas.Handle,
+            LDestPoints,
+            ABitmap.Canvas.Handle,
+            0,
+            0,
+            ABitmap.Width,
+            ABitmap.Height,
+            0,
+            0,
+            0);
+    Finally
+        SetStretchBltMode(
+            ACanvas.Handle,
+            LOldStretchMode);
+    End;
+End;
+
+
+Class Function TRotatedEditGDIRenderer.CreateEditSurfaceRegion(
     Const ALayout: TRotatedEditLayoutResult): HRGN;
 Var
     LPoints: Array[0..3] Of TPoint;
@@ -344,7 +450,7 @@ Begin
         WINDING);
 End;
 
-Class Function TRotatedEditRenderer.ResolveProjectedGapFillColor(
+Class Function TRotatedEditGDIRenderer.ResolveProjectedGapFillColor(
     ABackgroundBitmap: TBitmap;
     Const AColors: TRotatedEditStyleColors): TColor;
 Var
@@ -384,7 +490,7 @@ Begin
     Result := ABackgroundBitmap.Canvas.Pixels[LX, LY];
 End;
 
-Class Procedure TRotatedEditRenderer.DrawBackground(
+Class Procedure TRotatedEditGDIRenderer.DrawBackground(
     ACanvas: TCanvas;
     Const ALayout: TRotatedEditLayoutResult;
     Const AColors: TRotatedEditStyleColors;
@@ -392,8 +498,6 @@ Class Procedure TRotatedEditRenderer.DrawBackground(
     Var ABackgroundBitmapValid: Boolean;
     AShowDebugBounds: Boolean);
 Var
-    LSavedXForm: TXForm;
-    LSavedGraphicsMode: Integer;
     LEditRegion: HRGN;
 Begin
     //-------------------------------------------------------------------------
@@ -450,22 +554,10 @@ Begin
             DeleteObject(LEditRegion);
     End;
 
-    BeginWorldTransform(
+    DrawProjectedBitmap(
         ACanvas,
         ALayout,
-        LSavedXForm,
-        LSavedGraphicsMode);
-    Try
-        ACanvas.Draw(
-            0,
-            0,
-            ABackgroundBitmap);
-    Finally
-        EndWorldTransform(
-            ACanvas,
-            LSavedXForm,
-            LSavedGraphicsMode);
-    End;
+        ABackgroundBitmap);
 
     If AShowDebugBounds Then Begin
         //---------------------------------------------------------------------
@@ -483,44 +575,9 @@ Begin
         ACanvas.Pen.Style := psSolid;
     End;
 
-
-    BeginWorldTransform(
-        ACanvas,
-        ALayout,
-        LSavedXForm,
-        LSavedGraphicsMode);
-    Try
-        //---------------------------------------------------------------------
-        //Fill projected edit region before drawing the cached bitmap.
-        //
-        //At arbitrary angles some GDI bitmap projections can leave a one-pixel
-        //unpainted strip along an edge because of rounding. Filling the same
-        //canonical rectangle under the same world transform removes that visual
-        //artifact before the styled bitmap is drawn.
-        //---------------------------------------------------------------------
-        ACanvas.Brush.Style := bsSolid;
-        ACanvas.Brush.Color := AColors.BackgroundColor;
-        ACanvas.Pen.Style := psClear;
-        ACanvas.Rectangle(
-            0,
-            0,
-            ALayout.LogicalLength,
-            ALayout.LogicalThickness);
-        ACanvas.Pen.Style := psSolid;
-
-        ACanvas.Draw(
-            0,
-            0,
-            ABackgroundBitmap);
-    Finally
-        EndWorldTransform(
-            ACanvas,
-            LSavedXForm,
-            LSavedGraphicsMode);
-    End;
 End;
 
-Class Procedure TRotatedEditRenderer.DrawSelection(
+Class Procedure TRotatedEditGDIRenderer.DrawSelection(
     ACanvas: TCanvas;
     Const ALayout: TRotatedEditLayoutResult;
     Const AColors: TRotatedEditStyleColors);
@@ -574,46 +631,301 @@ End;
 
 
 
-Class Function TRotatedEditRenderer.ComputeCanonicalTextY(
+Class Function TRotatedEditGDIRenderer.ComputeCanonicalTextY(
     ACanvas: TCanvas;
     Const ALayout: TRotatedEditLayoutResult): Integer;
-Var
-    LTextMetric: TTextMetric;
-    LContentHeight: Integer;
-    LTextHeight: Integer;
 Begin
     //-------------------------------------------------------------------------
-    //Computes the canonical Y coordinate passed to TextOut.
+    //Returns the canonical top coordinate owned by the layout engine.
     //
-    //This method is kept in the renderer because it depends on the actual
-    //selected canvas font. The layout engine only estimates text thickness; the
-    //renderer owns the final top coordinate used by TextOut.
+    //The renderer must not recompute vertical centering independently. Text,
+    //caret, selection and hit-testing all depend on TextOriginCanonical.Y. If
+    //the renderer applies a local Y correction here, the visible text can drift
+    //away from the caret and from mouse hit-testing.
     //
-    //Important rule:
-    //TextOut positions the complete font cell. The safest first approximation
-    //is therefore to center tmHeight inside CanonicalContentRect. Previous tests
-    //showed that subtracting tmInternalLeading moved the text too high, while
-    //centering only tmHeight - tmInternalLeading moved it too low.
-    //
-    //Do not replace this with DrawText(DT_VCENTER) without also reviewing the
-    //caret and hit-test metrics. DrawText previously introduced a horizontal
-    //caret/text mismatch.
+    //The GDI layout currently derives TextOriginCanonical.Y from tmHeight and
+    //tmInternalLeading. A future DirectWrite backend will provide its own metric
+    //model through its own layout implementation.
     //-------------------------------------------------------------------------
-    GetTextMetrics(
-        ACanvas.Handle,
-        LTextMetric);
-
-    LContentHeight := ALayout.CanonicalContentRect.Height;
-    LTextHeight := LTextMetric.tmHeight;
-
-    If LTextHeight < 1 Then
-        LTextHeight := ALayout.TextThickness;
-
-    Result := ALayout.CanonicalContentRect.Top +
-        ((LContentHeight - LTextHeight) Div 2);
+    Result := Round(ALayout.TextOriginCanonical.Y);
 End;
 
-Class Procedure TRotatedEditRenderer.DrawSelectionOnCanonicalCanvas(
+Class Function TRotatedEditGDIRenderer.IsOrthogonalAngle(
+    AAngle: Double): Boolean;
+Var
+    LAngle: Double;
+    LNearestQuarter: Double;
+Begin
+    //-------------------------------------------------------------------------
+    //Returns True for the four angles where ClearType/subpixel orientation is
+    //not problematic for the historical GDI renderer.
+    //
+    //For arbitrary angles the renderer must avoid ClearType. ClearType is a
+    //subpixel technique tied to the physical horizontal RGB order of the
+    //monitor. Once glyphs are rotated, especially at shallow angles such as
+    //9, 10, 11 or 20 degrees, color fringes can become severe and may look like
+    //random corrupted pixels.
+    //-------------------------------------------------------------------------
+    LAngle := TRotatedEditGeometry.NormalizeAngle(AAngle);
+    LNearestQuarter := Round(LAngle / 90.0) * 90.0;
+
+    Result := Abs(LAngle - LNearestQuarter) < 0.001;
+End;
+
+Class Function TRotatedEditGDIRenderer.CreateRotationSafeFont(
+    ACanvas: TCanvas;
+    Const ALayout: TRotatedEditLayoutResult): HFONT;
+Var
+    LLogFont: TLogFont;
+Begin
+    //-------------------------------------------------------------------------
+    //Creates a temporary font suitable for direct rotated GDI text output.
+    //
+    //Why this helper exists
+    //----------------------
+    //The old GDI fallback rendered text horizontally into a cached bitmap and
+    //then projected that bitmap at the edit angle. That is unsafe when the font
+    //uses ClearType: the subpixel RGB data is already baked into the bitmap in
+    //horizontal screen order, and rotating the bitmap makes those color samples
+    //visible as blue/orange/green fragments.
+    //
+    //The corrected fallback draws text directly on the final canvas while the
+    //same world transform as the geometry pipeline is active. The font itself
+    //must stay unrotated: the world transform owns the rotation. This avoids the
+    //double-model problem where the text anchor is transformed manually while
+    //GDI also applies lfEscapement / lfOrientation to the glyphs.
+    //
+    //For arbitrary angles the cloned font disables ClearType and uses grayscale
+    //antialiasing. That is the actual bug fix: the text is rasterized after the
+    //rotation model is active, instead of rotating an already ClearType-colored
+    //bitmap.
+    //
+    //Orthogonal angles keep the source quality. They do not suffer from the
+    //same subpixel resampling issue and preserving the original quality keeps
+    //horizontal rendering visually close to a normal TEdit.
+    //-------------------------------------------------------------------------
+    Result := 0;
+
+    FillChar(
+        LLogFont,
+        SizeOf(LLogFont),
+        0);
+
+    If GetObject(
+        ACanvas.Font.Handle,
+        SizeOf(LLogFont),
+        @LLogFont) = 0 Then
+        Exit;
+
+    LLogFont.lfEscapement := 0;
+    LLogFont.lfOrientation := 0;
+
+    If Not IsOrthogonalAngle(ALayout.Angle) Then
+        LLogFont.lfQuality := ANTIALIASED_QUALITY;
+
+    Result := CreateFontIndirect(LLogFont);
+End;
+
+Class Function TRotatedEditGDIRenderer.CreateContentClipRegion(
+    Const ALayout: TRotatedEditLayoutResult): HRGN;
+Var
+    LPoints: Array[0..3] Of TPoint;
+Begin
+    //-------------------------------------------------------------------------
+    //Creates a clipping region from the projected canonical content rectangle.
+    //
+    //The text is now drawn directly on the final canvas, not inside the cached
+    //content bitmap. Therefore the old canonical rectangular clip used by
+    //PrepareContentBitmap is no longer sufficient. The clip must be expressed
+    //in actual coordinates and must follow the rotated content quad.
+    //-------------------------------------------------------------------------
+    LPoints[0] := Point(
+        Round(ALayout.ActualContentQuad.P1.X),
+        Round(ALayout.ActualContentQuad.P1.Y));
+
+    LPoints[1] := Point(
+        Round(ALayout.ActualContentQuad.P2.X),
+        Round(ALayout.ActualContentQuad.P2.Y));
+
+    LPoints[2] := Point(
+        Round(ALayout.ActualContentQuad.P3.X),
+        Round(ALayout.ActualContentQuad.P3.Y));
+
+    LPoints[3] := Point(
+        Round(ALayout.ActualContentQuad.P4.X),
+        Round(ALayout.ActualContentQuad.P4.Y));
+
+    Result := CreatePolygonRgn(
+        LPoints,
+        Length(LPoints),
+        WINDING);
+End;
+
+Class Procedure TRotatedEditGDIRenderer.DrawTextDirectOnFinalCanvas(
+    ACanvas: TCanvas;
+    Const ALayout: TRotatedEditLayoutResult;
+    Const AColors: TRotatedEditStyleColors;
+    Const ATextHint: String);
+Var
+    LDisplayText: String;
+    LDisplayTextColor: TColor;
+    LTextY: Integer;
+    LClipRegion: HRGN;
+    LSavedDC: Integer;
+    LSavedBkMode: Integer;
+    LSavedTextAlign: UINT;
+    LSavedXForm: TXForm;
+    LSavedGraphicsMode: Integer;
+    LFont: HFONT;
+    LOldFont: HGDIOBJ;
+    LTextMetric: TTextMetric;
+    LTextBaselineY: Integer;
+Begin
+    //-------------------------------------------------------------------------
+    //Draws the editable text directly on the final canvas.
+    //
+    //This is the critical bug fix for the GDI backend.
+    //
+    //Old pipeline:
+    //  TextOut with possible ClearType -> cached bitmap -> rotated bitmap.
+    //
+    //Corrected GDI fallback:
+    //  final canvas clip -> world transform -> TextOut in canonical coords.
+    //
+    //This keeps glyph rasterization in the final orientation and avoids rotating
+    //an already subpixel-rasterized text bitmap. It also keeps the same canonical
+    //coordinates as the existing layout/caret model, so the fallback remains
+    //compatible with the current hit-test and scroll calculations.
+    //
+    //Selection text color:
+    //The historical renderer did not split the string into selected/unselected
+    //runs. This fix preserves that behavior intentionally. A later improvement
+    //can draw selected runs separately, but it must be done in the same backend
+    //that owns text metrics.
+    //-------------------------------------------------------------------------
+    LDisplayText := ALayout.Text;
+    LDisplayTextColor := AColors.TextColor;
+
+    If (LDisplayText = '') And (ATextHint <> '') Then Begin
+        LDisplayText := ATextHint;
+        LDisplayTextColor := AColors.HintTextColor;
+    End;
+
+    If LDisplayText = '' Then
+        Exit;
+
+    LFont := CreateRotationSafeFont(
+        ACanvas,
+        ALayout);
+
+    If LFont = 0 Then
+        Exit;
+
+    LClipRegion := CreateContentClipRegion(ALayout);
+    LSavedDC := SaveDC(ACanvas.Handle);
+    LOldFont := 0;
+    Try
+        If LClipRegion <> 0 Then
+            SelectClipRgn(
+                ACanvas.Handle,
+                LClipRegion);
+
+        LOldFont := SelectObject(
+            ACanvas.Handle,
+            LFont);
+
+        SetTextColor(
+            ACanvas.Handle,
+            ColorToRGB(LDisplayTextColor));
+
+        LSavedBkMode := SetBkMode(
+            ACanvas.Handle,
+            TRANSPARENT);
+
+        LSavedTextAlign := SetTextAlign(
+            ACanvas.Handle,
+            TA_LEFT Or TA_BASELINE Or TA_NOUPDATECP);
+        Try
+            //-----------------------------------------------------------------
+            //Direct rotated-text cross-axis centering rule.
+            //
+            //This path deliberately keeps the same world transform as the
+            //background, selection and caret geometry. The previous attempt to
+            //draw with a manually transformed anchor plus lfEscapement created
+            //a second rotation model and could make the text turn in the wrong
+            //direction on some Delphi/GDI combinations.
+            //
+            //The only change compared with the first antialias fix is the text
+            //anchor: instead of using TA_TOP, the renderer uses TA_BASELINE and
+            //computes the canonical baseline from the selected rotation-safe
+            //font metrics. Baseline anchoring is the native GDI text model and
+            //is more stable under GM_ADVANCED world transforms. The font cell
+            //remains centered inside CanonicalContentRect, so the text is
+            //centered in the edit thickness before projection.
+            //-----------------------------------------------------------------
+            GetTextMetrics(
+                ACanvas.Handle,
+                LTextMetric);
+
+            LTextY := ComputeCanonicalTextY(
+                ACanvas,
+                ALayout);
+
+            LTextBaselineY := LTextY + LTextMetric.tmAscent;
+
+            BeginWorldTransform(
+                ACanvas,
+                ALayout,
+                LSavedXForm,
+                LSavedGraphicsMode);
+            Try
+                If ALayout.Text = '' Then
+                    TextOut(
+                        ACanvas.Handle,
+                        ALayout.CanonicalContentRect.Left,
+                        LTextBaselineY,
+                        PChar(LDisplayText),
+                        Length(LDisplayText))
+                Else
+                    TextOut(
+                        ACanvas.Handle,
+                        Round(ALayout.TextOriginCanonical.X),
+                        LTextBaselineY,
+                        PChar(LDisplayText),
+                        Length(LDisplayText));
+            Finally
+                EndWorldTransform(
+                    ACanvas,
+                    LSavedXForm,
+                    LSavedGraphicsMode);
+            End;
+        Finally
+            SetTextAlign(
+                ACanvas.Handle,
+                LSavedTextAlign);
+
+            SetBkMode(
+                ACanvas.Handle,
+                LSavedBkMode);
+        End;
+    Finally
+        If LOldFont <> 0 Then
+            SelectObject(
+                ACanvas.Handle,
+                LOldFont);
+
+        RestoreDC(
+            ACanvas.Handle,
+            LSavedDC);
+
+        If LClipRegion <> 0 Then
+            DeleteObject(LClipRegion);
+
+        DeleteObject(LFont);
+    End;
+End;
+
+Class Procedure TRotatedEditGDIRenderer.DrawSelectionOnCanonicalCanvas(
     ACanvas: TCanvas;
     Const ALayout: TRotatedEditLayoutResult;
     Const AColors: TRotatedEditStyleColors);
@@ -692,7 +1004,7 @@ Begin
     ACanvas.Pen.Style := psSolid;
 End;
 
-Class Procedure TRotatedEditRenderer.PrepareContentBitmap(
+Class Procedure TRotatedEditGDIRenderer.PrepareContentBitmap(
     ASourceCanvas: TCanvas;
     AContentBitmap: TBitmap;
     ABackgroundBitmap: TBitmap;
@@ -835,7 +1147,7 @@ Begin
     End;
 End;
 
-Class Procedure TRotatedEditRenderer.DrawContent(
+Class Procedure TRotatedEditGDIRenderer.DrawContent(
     ACanvas: TCanvas;
     Const ALayout: TRotatedEditLayoutResult;
     Const AColors: TRotatedEditStyleColors;
@@ -846,53 +1158,50 @@ Class Procedure TRotatedEditRenderer.DrawContent(
     AShowDebugBounds: Boolean;
     Const ATextHint: String);
 Var
-    LSavedXForm: TXForm;
-    LSavedGraphicsMode: Integer;
     LEditRegion: HRGN;
 Begin
     //-------------------------------------------------------------------------
-    //Draws the complete non-caret content.
+    //Draws the complete non-caret content for the GDI backend.
     //
-    //This method is now the normal rendering entry point for the edit surface.
-    //It prepares the background cache if needed, composes the opaque content
-    //bitmap if needed, pre-fills the actual projected region to avoid thin GDI
-    //projection strips, and projects the content bitmap.
+    //Important 114 bug-fix rule
+    //-----------------------------
+    //The GDI fallback must not draw the text into a bitmap that is then rotated
+    //or projected. That old pipeline corrupts ClearType/subpixel glyphs at some
+    //arbitrary angles, especially shallow angles around 9, 10, 11 and 20 degrees.
     //
-    //The caret remains outside this pipeline so the blink timer does not
-    //invalidate or rebuild background/content surfaces.
+    //The safe fallback pipeline is now:
+    //  1. prepare the canonical background/border bitmap;
+    //  2. pre-fill the projected edit surface to hide projection rounding gaps;
+    //  3. project only the background/border bitmap;
+    //  4. draw the selection background directly from actual selection quads;
+    //  5. draw the text directly on the final canvas under the same world
+    //     transform as the geometry engine, using a rotation-safe font quality.
+    //
+    //The AContentBitmap parameters are retained for API/package compatibility
+    //with the current backend interface step. They are deliberately not used by
+    //this corrected path because the cached content bitmap is precisely what
+    //caused the rotated ClearType artifacts.
     //-------------------------------------------------------------------------
-    If AContentBitmap = Nil Then
+    AContentBitmapValid := False;
+
+    If ABackgroundBitmap = Nil Then
         Exit;
 
-    If (ABackgroundBitmap <> Nil) And Not ABackgroundBitmapValid Then Begin
+    If Not ABackgroundBitmapValid Then Begin
         PrepareBackgroundBitmap(
             ABackgroundBitmap,
             ALayout,
             AColors);
 
         ABackgroundBitmapValid := True;
-        AContentBitmapValid := False;
-    End;
-
-    If Not AContentBitmapValid Then Begin
-        PrepareContentBitmap(
-            ACanvas,
-            AContentBitmap,
-            ABackgroundBitmap,
-            ALayout,
-            AColors,
-            ATextHint);
-
-        AContentBitmapValid := True;
     End;
 
     //-------------------------------------------------------------------------
-    //Pre-fill the actual projected region.
+    //Pre-fill the actual projected region before the bitmap projection.
     //
-    //Even with an opaque bitmap, arbitrary-angle bitmap projection can leave a
-    //thin strip because of pixel rounding. Filling the actual polygon with the
-    //same color as the styled background bitmap prevents visible holes without
-    //sampling text or selection pixels from the content bitmap.
+    //Only the background/border bitmap is projected now. Text is drawn later as
+    //real GDI text, not as rotated pixels. The pre-fill still prevents tiny
+    //empty strips along the edge of the projected edit surface.
     //-------------------------------------------------------------------------
     LEditRegion := CreateEditSurfaceRegion(ALayout);
     Try
@@ -912,22 +1221,21 @@ Begin
             DeleteObject(LEditRegion);
     End;
 
-    BeginWorldTransform(
+    DrawProjectedBitmap(
         ACanvas,
         ALayout,
-        LSavedXForm,
-        LSavedGraphicsMode);
-    Try
-        ACanvas.Draw(
-            0,
-            0,
-            AContentBitmap);
-    Finally
-        EndWorldTransform(
-            ACanvas,
-            LSavedXForm,
-            LSavedGraphicsMode);
-    End;
+        ABackgroundBitmap);
+
+    DrawSelection(
+        ACanvas,
+        ALayout,
+        AColors);
+
+    DrawTextDirectOnFinalCanvas(
+        ACanvas,
+        ALayout,
+        AColors,
+        ATextHint);
 
     If AShowDebugBounds Then Begin
         ACanvas.Brush.Style := bsClear;
@@ -941,7 +1249,7 @@ End;
 
 
 
-Class Procedure TRotatedEditRenderer.DrawCaret(
+Class Procedure TRotatedEditGDIRenderer.DrawCaret(
     ACanvas: TCanvas;
     Const ALayout: TRotatedEditLayoutResult;
     Const AColors: TRotatedEditStyleColors;

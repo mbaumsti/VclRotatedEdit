@@ -41,8 +41,8 @@ object RotatedEditDemoForm: TRotatedEditDemoForm
     Caption = 'Vertical up edit'
   end
   object FreeAngleLabel: TLabel
-    Left = 21
-    Top = 266
+    Left = 19
+    Top = 312
     Width = 87
     Height = 17
     Caption = 'Free angle edit'
@@ -97,19 +97,19 @@ object RotatedEditDemoForm: TRotatedEditDemoForm
     Left = 20
     Top = 204
     Width = 237
-    Height = 27
+    Height = 25
     Cursor = crIBeam
     ParentColor = False
     TabOrder = 2
     Text = 'Horizontal editable text'
     LogicalLength = 237
-    LogicalThickness = 27
+    LogicalThickness = 25
     InternalOriginActive = True
     InternalOriginX = 0.000000000000000000
     InternalOriginY = 0.000000000000000000
   end
   object VerticalDownEdit: TRotatedEdit
-    Left = 55
+    Left = 56
     Top = 550
     Width = 26
     Height = 150
@@ -122,12 +122,12 @@ object RotatedEditDemoForm: TRotatedEditDemoForm
     LogicalLength = 150
     LogicalThickness = 25
     InternalOriginActive = True
-    InternalOriginX = 26.000000000000000000
-    InternalOriginY = 0.500000000000000000
+    InternalOriginX = 25.000000000000030000
+    InternalOriginY = 0.000000000000004592
   end
   object VerticalUpEdit: TRotatedEdit
     Left = 187
-    Top = 551
+    Top = 550
     Width = 26
     Height = 150
     Cursor = crIBeam
@@ -140,11 +140,11 @@ object RotatedEditDemoForm: TRotatedEditDemoForm
     LogicalThickness = 25
     InternalOriginActive = True
     InternalOriginX = 0.000000000000000000
-    InternalOriginY = 149.500000000000000000
+    InternalOriginY = 150.000000000000000000
   end
   object FreeAngleEdit: TRotatedEdit
-    Left = 29
-    Top = 335
+    Left = 27
+    Top = 381
     Width = 119
     Height = 119
     Cursor = crIBeam
@@ -166,9 +166,9 @@ object RotatedEditDemoForm: TRotatedEditDemoForm
     InternalOriginY = 0.000000000000000000
   end
   object TrackBarRotation: TTrackBar
-    Left = 21
-    Top = 285
-    Width = 150
+    Left = 19
+    Top = 331
+    Width = 237
     Height = 45
     Max = 360
     Frequency = 10
@@ -232,8 +232,8 @@ object RotatedEditDemoForm: TRotatedEditDemoForm
     object RotatedEdit1: TRotatedEdit
       Left = 10
       Top = 66
-      Width = 148
-      Height = 137
+      Width = 138
+      Height = 138
       Cursor = crIBeam
       ParentColor = False
       TabOrder = 2
@@ -265,8 +265,8 @@ object RotatedEditDemoForm: TRotatedEditDemoForm
       OnMouseWheelDown = CustomAngleEditMouseWheelDown
       OnMouseWheelUp = CustomAngleEditMouseWheelUp
       InternalOriginActive = True
-      InternalOriginX = 0.000000000000003553
-      InternalOriginY = 120.265548008343600000
+      InternalOriginX = 0.000000000000000000
+      InternalOriginY = 120.208152801713100000
     end
   end
 end

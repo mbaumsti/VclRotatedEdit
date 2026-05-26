@@ -25,14 +25,16 @@ Unit VclRotatedEdit_Style;
 Interface
 
 Uses
+    System.Types,
     Vcl.Graphics,
     Vcl.Controls,
     Vcl.Forms,
-    Vcl.Themes;
+    Vcl.Themes,
+    VclRotatedEdit_Types;
 
 Type
     {
-      Fully resolved rendering contract used by TRotatedEditRenderer.
+      Fully resolved rendering contract used by the active render backend.
 
       The renderer must not decide whether a style is active, whether the border
       is visible, or which fallback color should be used. Those decisions are
@@ -64,6 +66,12 @@ Type
     End;
 
     TRotatedEditStyle = Class
+    private
+        Class Function ResolveStyleServices(
+            AControl: TControl;
+            AUseStylePalette: Boolean;
+            AStyleName: String): TCustomStyleServices; Static;
+
     public
         {
           Resolves all colors and style switches for the current control state.
@@ -99,13 +107,88 @@ Type
             AStyleName: String;
             AStyleElements: TStyleElements;
             ABorderStyle: TBorderStyle): TRotatedEditStyleColors; Static;
+
+        {
+          Resolves the real canonical content insets of the edit frame.
+
+          The layout engine needs this before drawing, because these metrics
+          define the rectangle where text, caret, selection and hit-testing live.
+          A styled VCL edit does not always have a 1-pixel border. In several
+          styles the visual frame consumes two pixels on the top/bottom, and the
+          returned content rectangle can be asymmetric.
+
+          The method intentionally receives a canvas: StyleServices can need a
+          valid HDC to compute GetElementContentRect for the current style.
+        }
+        Class Function ResolveBorderMetrics(
+            ACanvas: TCanvas;
+            AControl: TControl;
+            AUseStylePalette: Boolean;
+            AStyleName: String;
+            AStyleElements: TStyleElements;
+            ABorderStyle: TBorderStyle): TRotatedEditBorderMetrics; Static;
     End;
 
 Implementation
 
 Uses
+    Winapi.Windows,
     System.Classes,
+    System.SysUtils,
     System.UITypes;
+
+Class Function TRotatedEditStyle.ResolveStyleServices(
+    AControl: TControl;
+    AUseStylePalette: Boolean;
+    AStyleName: String): TCustomStyleServices;
+Begin
+    //-------------------------------------------------------------------------
+    //Centralizes the VCL style-service selection used by both color and border
+    //metric resolution.
+    //
+    //Why this helper exists
+    //----------------------
+    //The layout is now based on the real styled edit content rectangle. If the
+    //color resolver and the metric resolver used different StyleServices
+    //instances, the renderer could draw one frame while the layout reserves the
+    //insets of another. That would reintroduce vertical/cross-axis offsets.
+    //
+    //Runtime keeps the existing v76 order. Design-time still prefers the
+    //parent/control context so a component dropped on a styled form follows the
+    //designer surface rather than the IDE/global style.
+    //-------------------------------------------------------------------------
+    Result := StyleServices;
+
+    If Not AUseStylePalette Then
+        Exit;
+
+    Result := Nil;
+
+    If AStyleName <> '' Then
+        Result := TStyleManager.Style[AStyleName];
+
+    If Result = Nil Then Begin
+        If (AControl <> Nil) And
+           (csDesigning In AControl.ComponentState) Then Begin
+            If AControl.Parent <> Nil Then
+                Result := StyleServices(AControl.Parent);
+
+            If Result = Nil Then
+                Result := StyleServices(AControl);
+        End Else Begin
+            Result := ThemeServices;
+
+            If Result = Nil Then
+                Result := TStyleManager.ActiveStyle;
+
+            If Result = Nil Then
+                Result := StyleServices;
+        End;
+    End;
+
+    If Result = Nil Then
+        Result := StyleServices;
+End;
 
 Class Function TRotatedEditStyle.ResolveColors(
     AControl: TControl;
@@ -172,47 +255,10 @@ Begin
         //practical behavior of standard controls placed on the same form while
         //keeping the owner-drawn rendering pipeline intact.
         //---------------------------------------------------------------------
-        LStyleServices := Nil;
-
-        If AStyleName <> '' Then
-            LStyleServices := TStyleManager.Style[AStyleName];
-
-        If LStyleServices = Nil Then Begin
-            If (AControl <> Nil) And
-               (csDesigning In AControl.ComponentState) Then Begin
-                //-------------------------------------------------------------
-                //Design-time branch only.
-                //
-                //The parent is preferred because it belongs to the designed
-                //form/control hierarchy. This is the closest available context
-                //to the visual style that the designer applies to ordinary VCL
-                //controls such as TEdit.
-                //-------------------------------------------------------------
-                If AControl.Parent <> Nil Then
-                    LStyleServices := StyleServices(AControl.Parent);
-
-                If LStyleServices = Nil Then
-                    LStyleServices := StyleServices(AControl);
-            End Else Begin
-                //-------------------------------------------------------------
-                //Runtime branch.
-                //
-                //Do not change this order unless the runtime behavior becomes
-                //wrong. In v76 this path already resolves the correct colors in
-                //executed applications.
-                //-------------------------------------------------------------
-                LStyleServices := ThemeServices;
-
-                If LStyleServices = Nil Then
-                    LStyleServices := TStyleManager.ActiveStyle;
-
-                If LStyleServices = Nil Then
-                    LStyleServices := StyleServices;
-            End;
-        End;
-
-        If LStyleServices = Nil Then
-            LStyleServices := StyleServices;
+        LStyleServices := ResolveStyleServices(
+            AControl,
+            AUseStylePalette,
+            AStyleName);
 
         Result.VclStyleServices := LStyleServices;
 
@@ -288,6 +334,114 @@ Begin
     //StyleServices. Otherwise BorderColor is used as-is. We do not force a
     //custom focus highlight because that would make BorderColor unpredictable.
     //-------------------------------------------------------------------------
+End;
+
+Class Function TRotatedEditStyle.ResolveBorderMetrics(
+    ACanvas: TCanvas;
+    AControl: TControl;
+    AUseStylePalette: Boolean;
+    AStyleName: String;
+    AStyleElements: TStyleElements;
+    ABorderStyle: TBorderStyle): TRotatedEditBorderMetrics;
+Var
+    LStyleServices: TCustomStyleServices;
+    LDetails: TThemedElementDetails;
+    LOuterRect: TRect;
+    LContentRect: TRect;
+    LEdgeX: Integer;
+    LEdgeY: Integer;
+Begin
+    //-------------------------------------------------------------------------
+    //Default contract.
+    //
+    //No frame means no border inset. The public TextPaddingStart/TextPaddingEnd
+    //are still applied later by the layout engine.
+    //-------------------------------------------------------------------------
+    Result.Left := 0;
+    Result.Top := 0;
+    Result.Right := 0;
+    Result.Bottom := 0;
+
+    If ABorderStyle = bsNone Then
+        Exit;
+
+    //-------------------------------------------------------------------------
+    //Styled VCL frame path.
+    //
+    //When seBorder participates in repmStyle, the renderer delegates the edit
+    //frame to StyleServices.DrawElement(teEditTextNormal). The matching content
+    //insets must therefore also come from StyleServices.GetElementContentRect.
+    //This is the important fix: a styled TEdit often reserves more than one
+    //pixel, and the content margins are not guaranteed to be symmetric.
+    //-------------------------------------------------------------------------
+    If AUseStylePalette And
+       (seBorder In AStyleElements) Then Begin
+        LStyleServices := ResolveStyleServices(
+            AControl,
+            AUseStylePalette,
+            AStyleName);
+
+        If (LStyleServices <> Nil) And
+           LStyleServices.Enabled And
+           (ACanvas <> Nil) Then Begin
+            LOuterRect := Rect(
+                0,
+                0,
+                100,
+                100);
+
+            LDetails := LStyleServices.GetElementDetails(teEditTextNormal);
+
+            If LStyleServices.GetElementContentRect(
+                ACanvas.Handle,
+                LDetails,
+                LOuterRect,
+                LContentRect) Then Begin
+                Result.Left := LContentRect.Left - LOuterRect.Left;
+                Result.Top := LContentRect.Top - LOuterRect.Top;
+                Result.Right := LOuterRect.Right - LContentRect.Right;
+                Result.Bottom := LOuterRect.Bottom - LContentRect.Bottom;
+
+                If Result.Left < 0 Then
+                    Result.Left := 0;
+
+                If Result.Top < 0 Then
+                    Result.Top := 0;
+
+                If Result.Right < 0 Then
+                    Result.Right := 0;
+
+                If Result.Bottom < 0 Then
+                    Result.Bottom := 0;
+
+                Exit;
+            End;
+        End;
+    End;
+
+    //-------------------------------------------------------------------------
+    //Classic / unstyled fallback.
+    //
+    //The owner-drawn non-styled path draws a simple one-pixel rectangle. Its
+    //layout inset must therefore stay one pixel; using SM_CXEDGE/SM_CYEDGE here
+    //would reserve a two-pixel 3D client edge that the renderer does not draw.
+    //
+    //The system metrics are still read as a documented fallback reference for
+    //future changes, but the active v1 fallback remains the actual pen width.
+    //-------------------------------------------------------------------------
+    LEdgeX := GetSystemMetrics(SM_CXEDGE);
+    LEdgeY := GetSystemMetrics(SM_CYEDGE);
+
+    If LEdgeX < 1 Then
+        LEdgeX := 1;
+
+    If LEdgeY < 1 Then
+        LEdgeY := 1;
+
+    Result.Left := 1;
+    Result.Top := 1;
+    Result.Right := 1;
+    Result.Bottom := 1;
 End;
 
 End.
