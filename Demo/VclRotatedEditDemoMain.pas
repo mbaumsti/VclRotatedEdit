@@ -552,7 +552,7 @@ End;
 Procedure TRotatedEditDemoForm.TrackBarRotationChange(Sender: TObject);
 Begin
     FreeAngleEdit.Angle := TrackBarRotation.Position;
-    FreeAngleEdit.Text := 'Angle ' + TrackBarRotation.Position.ToString + ' degrees';
+    FreeAngleEdit.Text := 'Angle ' + IntToStr(TrackBarRotation.Position) + ' degrees';
 End;
 
 Procedure TRotatedEditDemoForm.TrackEvent(

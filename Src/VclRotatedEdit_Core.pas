@@ -24,6 +24,10 @@ Unit VclRotatedEdit_Core;
 
 Interface
 
+{$IF CompilerVersion >= 34.0}
+  {$DEFINE VCLROTATEDEDIT_HAS_CONTROL_STYLE_NAME}
+{$IFEND}
+
 Uses
     Winapi.Windows,
     Winapi.Messages,
@@ -708,7 +712,9 @@ Type
         Property ParentColor;
         Property ParentFont;
         Property StyleElements;
+        {$IFDEF VCLROTATEDEDIT_HAS_CONTROL_STYLE_NAME}
         Property StyleName;
+        {$ENDIF}
         Property ParentShowHint;
         Property PopupMenu;
         Property ShowHint;
@@ -2912,7 +2918,7 @@ Begin
     //hard-coded padding table. Native/styled TEdit height depends on font
     //metrics, border style, DPI, active VCL style and parent style context.
     //
-    //Important rule fixed in increment 117:
+    //Important compatibility rule:
     //The temporary TEdit must be attached to the same parent window/context as
     //the rotated edit whenever possible. A TEdit created only with
     //ParentWindow := GetDesktopWindow can report a smaller AutoSize height on
@@ -4644,7 +4650,11 @@ Begin
         Font.Color,
         FBorderColor,
         FPaletteMode = repmStyle,
+        {$IFDEF VCLROTATEDEDIT_HAS_CONTROL_STYLE_NAME}
         StyleName,
+        {$ELSE}
+        '',
+        {$ENDIF}
         StyleElements,
         FBorderStyle);
 
@@ -4721,7 +4731,11 @@ Begin
         Canvas,
         Self,
         FPaletteMode = repmStyle,
+        {$IFDEF VCLROTATEDEDIT_HAS_CONTROL_STYLE_NAME}
         StyleName,
+        {$ELSE}
+        '',
+        {$ENDIF}
         StyleElements,
         FBorderStyle);
     LInput.PaddingLeft := FPaddingLeft;

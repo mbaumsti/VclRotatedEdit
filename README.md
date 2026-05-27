@@ -327,9 +327,19 @@ If your PasDoc version does not support `@` response files, use the fallback com
 
 ---
 
-## Recent changes in increment 118
+## Recent changes in version 1.0.2
 
-This increment is intended as a corrective release before the Direct2D/DirectWrite work continues.
+This release is a compatibility attempt for Delphi 10.2.3 while preserving the style behavior validated on newer Delphi versions.
+
+- Added conditional compilation guards around newer per-control VCL style APIs.
+- `TControl.StyleName` is now published and passed to the style resolver only when the compiler is new enough to support per-control styling.
+- `StyleServices(Control)` / `StyleServices(Parent)` calls are now used only on newer Delphi versions; older compilers fall back to the global `StyleServices`.
+- Delphi 10.2.3 should therefore keep normal application-level VCL style support, without per-control `StyleName` support.
+- Performed a compatibility scan for common newer Delphi syntax patterns such as inline variable declarations and `.ToString` calls. No such usage was found in the source units.
+
+## Previous changes in version 1.0.1
+
+This release was intended as a corrective release before the Direct2D/DirectWrite work continues.
 
 - Kept the validated GDI arbitrary-angle text fix: text is no longer rendered as ClearType into a horizontal bitmap and then rotated.
 - Kept the style-aware border metric fix: layout now uses the real VCL-style edit content margins instead of assuming a fixed one-pixel border.

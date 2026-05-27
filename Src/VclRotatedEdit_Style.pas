@@ -24,6 +24,11 @@ Unit VclRotatedEdit_Style;
 
 Interface
 
+{$IF CompilerVersion >= 34.0}
+  {$DEFINE VCLROTATEDEDIT_HAS_CONTROL_STYLE_NAME}
+  {$DEFINE VCLROTATEDEDIT_HAS_CONTROL_STYLE_SERVICES}
+{$IFEND}
+
 Uses
     System.Types,
     Vcl.Graphics,
@@ -164,17 +169,34 @@ Begin
 
     Result := Nil;
 
+    {$IFDEF VCLROTATEDEDIT_HAS_CONTROL_STYLE_NAME}
+    //---------------------------------------------------------------------
+    //Per-control VCL style names were introduced after Delphi 10.2.3.
+    //Older compilers must not reference TControl.StyleName nor resolve a
+    //style through this newer control-level mechanism. They still use the
+    //global application VCL style fallback below.
+    //---------------------------------------------------------------------
     If AStyleName <> '' Then
         Result := TStyleManager.Style[AStyleName];
+    {$ENDIF}
 
     If Result = Nil Then Begin
         If (AControl <> Nil) And
            (csDesigning In AControl.ComponentState) Then Begin
+            {$IFDEF VCLROTATEDEDIT_HAS_CONTROL_STYLE_SERVICES}
+            //-------------------------------------------------------------
+            //Recent VCL versions expose StyleServices(Control). Delphi
+            //10.2.3 does not. For older compilers, keep the component
+            //buildable by falling back to the global StyleServices object.
+            //-------------------------------------------------------------
             If AControl.Parent <> Nil Then
                 Result := StyleServices(AControl.Parent);
 
             If Result = Nil Then
                 Result := StyleServices(AControl);
+            {$ELSE}
+            Result := StyleServices;
+            {$ENDIF}
         End Else Begin
             Result := ThemeServices;
 
