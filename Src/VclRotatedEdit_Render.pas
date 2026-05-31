@@ -20,6 +20,21 @@ Unit VclRotatedEdit_Render;
   Couche de support du rendu GDI historique du composant VCL VclRotatedEdit.
 
   Cette unité dessine le fond, la bordure, le texte, la sélection et le caret à partir du layout résolu en utilisant le pipeline GDI historique. Elle est désormais appelée uniquement par le backend GDI.
+
+  TODO GDI / post-Direct2D
+  -----------------------
+  Le pipeline GDI historique projette encore certaines surfaces préparées dans
+  un bitmap canonique droit vers le quadrilatère final du contrôle. Ce modèle a
+  montré ses limites sur les faibles angles : un cadre fin ou stylé, déjà
+  rastérisé dans le bitmap source, peut être épaissi ou dédoublé par la
+  projection GDI.
+
+  Si le backend GDI devait être repris plus tard, la règle à viser serait la
+  même que pour Direct2D : utiliser le bitmap uniquement comme double-buffer
+  final, c'est-à-dire comme surface déjà orientée, puis dessiner fond, cadre,
+  texte, sélection et caret directement dans le repère final. Il ne faut pas
+  ajouter de nouveaux chemins qui dessinent un contrôle droit pour le tourner
+  après coup.
 }
 
 Interface
@@ -236,8 +251,8 @@ Begin
         //
         //The renderer deliberately does not choose the style source. That
         //decision belongs to TRotatedEditStyle.ResolveColors so runtime can
-        //keep the already valid v76 behavior while design-time can use the
-        //parent/control style context discovered in v77.
+        //keep the established runtime behavior while design-time can use the
+        //parent/control style context resolved for the designed form.
         //-----------------------------------------------------------------
         LDetails := AColors.VclStyleServices.GetElementDetails(teEditTextNormal);
 

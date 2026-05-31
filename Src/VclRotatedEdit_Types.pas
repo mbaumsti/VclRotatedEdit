@@ -42,6 +42,23 @@ Type
     );
 
     {
+      Rendering backend requested by the component.
+
+      rebDirect2D is the default renderer. It uses native Direct2D/DirectWrite
+      when available and draws directly in the final oriented coordinate system.
+      This avoids the artefacts caused by projecting an already-rasterized
+      straight GDI bitmap onto an angled parallelogram.
+
+      rebGDI keeps the historical GDI renderer available for compatibility,
+      explicit testing and as the fallback path used by the Direct2D backend
+      when native resources are unavailable or a Direct2D paint pass fails.
+    }
+    TRotatedEditRenderBackendKind = (
+        rebGDI,
+        rebDirect2D
+    );
+
+    {
       Editing completion reason passed to OnEditingDone.
     }
     TRotatedEditEditingDoneReason = (
@@ -180,6 +197,17 @@ Type
         CanonicalEditRect: TRect;
         CanonicalContentRect: TRect;
 
+        //---------------------------------------------------------------------
+        //Resolved border metrics used to build CanonicalContentRect.
+        //
+        //The Direct2D backend also needs these values so it can fill the border
+        //as an area between the outer edit quad and the inner edit quad instead
+        //of drawing a centered 1-pixel outline. Keeping the values in the layout
+        //result prevents each renderer from recalculating a different border
+        //model.
+        //---------------------------------------------------------------------
+        BorderMetrics: TRotatedEditBorderMetrics;
+
         ActualOrigin: TRotatedEditFloatPoint;
         ActualEditQuad: TRotatedEditFloatQuad;
         ActualContentQuad: TRotatedEditFloatQuad;
@@ -188,6 +216,28 @@ Type
         Text: String;
         TextLength: Integer;
         TextThickness: Integer;
+
+        //---------------------------------------------------------------------
+        //Current selection indexes in text coordinates.
+        //
+        //The historical GDI renderer only needed SelectionQuads because the
+        //layout engine calculated the final geometry itself. The DirectWrite
+        //Direct2D path needs the original range too, so it can ask DirectWrite for
+        //native text positions without reverse-engineering the range from the
+        //already-built GDI quads.
+        //---------------------------------------------------------------------
+        SelStart: Integer;
+        SelLength: Integer;
+
+        //---------------------------------------------------------------------
+        // True when the selection must be painted by the active backend.
+        //
+        // The logical selection range is kept in SelStart/SelLength even when
+        // the control loses focus. This flag lets GDI and Direct2D hide the
+        // visual selection without losing the stored range, matching the usual
+        // TEdit behaviour.
+        //---------------------------------------------------------------------
+        SelectionVisible: Boolean;
 
         Angle: Double;
         ScrollOffset: Integer;

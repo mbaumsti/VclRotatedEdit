@@ -5,6 +5,8 @@ Src\VclRotatedEdit_Geometry.pas
 Src\VclRotatedEdit_Layout.pas
 Src\VclRotatedEdit_Render.pas
 Src\VclRotatedEdit_RenderBackend.pas
+Src\VclRotatedEdit_RenderBackend_GDI.pas
+Src\VclRotatedEdit_RenderBackend_Direct2D.pas
 Src\VclRotatedEdit_Style.pas
 Src\VclRotatedEdit_EditEngine.pas
 Src\VclRotatedEdit_Caret.pas

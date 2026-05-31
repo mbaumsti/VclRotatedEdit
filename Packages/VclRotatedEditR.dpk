@@ -28,6 +28,16 @@ Package VclRotatedEditR;
 {$DESCRIPTION 'TRotatedEdit runtime package'}
 {$IMPLICITBUILD ON}
 
+{
+  Runtime package.
+
+  The package contains both the historical GDI backend and the Direct2D /
+  DirectWrite backend. The selected renderer is controlled by the component's
+  RenderBackend property at runtime. Direct2D resource creation is guarded by
+  the backend itself and falls back to GDI if the native resources are not
+  available.
+}
+
 requires
   rtl,
   vcl;
@@ -43,6 +53,8 @@ contains
   VclRotatedEdit_Caret in '..\Src\VclRotatedEdit_Caret.pas',
   VclRotatedEdit_Clipboard in '..\Src\VclRotatedEdit_Clipboard.pas',
   VclRotatedEdit_Style in '..\Src\VclRotatedEdit_Style.pas',
-  VclRotatedEdit_RenderBackend in '..\Src\VclRotatedEdit_RenderBackend.pas';
+  VclRotatedEdit_RenderBackend in '..\Src\VclRotatedEdit_RenderBackend.pas',
+  VclRotatedEdit_RenderBackend_GDI in '..\Src\VclRotatedEdit_RenderBackend_GDI.pas',
+  VclRotatedEdit_RenderBackend_Direct2D in '..\Src\VclRotatedEdit_RenderBackend_Direct2D.pas';
 
 End.

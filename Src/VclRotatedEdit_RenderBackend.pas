@@ -7,7 +7,8 @@ Unit VclRotatedEdit_RenderBackend;
   VclRotatedEdit
   Copyright (c) 2026 Marc BAUMSTIMLER
 
-  Rendering backend contract of the VclRotatedEdit VCL component.
+  Common rendering backend contract and backend factory of the VclRotatedEdit
+  VCL component.
 
   Repository:
   https://github.com/mbaumsti/VclRotatedEdit
@@ -17,11 +18,21 @@ Unit VclRotatedEdit_RenderBackend;
 
   ------------------------------------------------------------------------------
 
-  Contrat de backend du composant VCL VclRotatedEdit.
+  Socle commun des backends de rendu du composant VCL VclRotatedEdit.
 
-  Cette unité introduit volontairement une frontière plus large qu'un simple
-  dessin final. Un backend de rendu possède aussi les mesures de texte et les
-  calculs dépendants de ces mesures : layout, hit-test, caret et sélection.
+  Cette unité ne doit pas contenir l'implémentation concrète d'un moteur de
+  rendu. Elle définit uniquement :
+
+  - le contrat IRotatedEditRenderBackend ;
+  - la fonction de création du backend effectif ;
+  - les règles communes qui garantissent que le coeur du composant reste
+    indépendant du moteur de rendu choisi.
+
+   les sources sont volontairement séparées en trois familles :
+
+  - VclRotatedEdit_RenderBackend.pas : contrat commun et factory ;
+  - VclRotatedEdit_RenderBackend_GDI.pas : backend GDI historique ;
+  - VclRotatedEdit_RenderBackend_Direct2D.pas : squelette Direct2D/DirectWrite.
 
   Règle d'architecture importante
   --------------------------------
@@ -31,9 +42,10 @@ Unit VclRotatedEdit_RenderBackend;
   issues du même moteur de mesure. Sinon des décalages apparaîtront entre le
   rendu réel du texte et les coordonnées manipulées par l'édition.
 
-  Cette première étape fournit uniquement le backend GDI historique, mais le
-  composant ne dépend déjà plus directement de TRotatedEditGDIRenderer ni de
-  TRotatedEditLayout pour les opérations dépendantes du rendu.
+  Cette unité reste donc le seul point connu du coeur du composant. Les unités
+  concrètes GDI et Direct2D sont seulement référencées dans l'implémentation de
+  la factory, afin d'éviter que VclRotatedEdit_Core.pas dépende directement
+  d'un renderer précis.
 }
 
 Interface
@@ -89,109 +101,48 @@ Type
         Property BackendName: String Read GetBackendName;
     End;
 
-    {
-      Historical GDI backend.
+{
+  Creates the effective rendering backend for the requested backend kind.
 
-      This class is intentionally thin. It preserves the exact existing GDI
-      behavior by delegating to the previous static helper classes. Its purpose
-      is not to redesign GDI; it is to move GDI behind the same contract that
-      the Direct2D/DirectWrite backend will implement later.
-    }
-    TRotatedEditGDIRenderBackend = Class(TInterfacedObject, IRotatedEditRenderBackend)
-    public
-        Function GetBackendName: String;
+  rebDirect2D is the normal default backend. It routes drawing and text metrics
+  through the native Direct2D/DirectWrite implementation when those resources
+  are available. rebGDI remains a selectable compatibility backend and is also
+  used as a safety fallback by the Direct2D backend.
 
-        Function BuildLayout(
-            ACanvas: TCanvas;
-            Const AInput: TRotatedEditLayoutInput): TRotatedEditLayoutResult;
-
-        Function HitTest(
-            ACanvas: TCanvas;
-            Const ALayout: TRotatedEditLayoutResult;
-            Const AActualPoint: TPoint): TRotatedEditHitTestResult;
-
-        Procedure DrawContent(
-            ACanvas: TCanvas;
-            Const ALayout: TRotatedEditLayoutResult;
-            Const AColors: TRotatedEditStyleColors;
-            ABackgroundBitmap: TBitmap;
-            Var ABackgroundBitmapValid: Boolean;
-            AContentBitmap: TBitmap;
-            Var AContentBitmapValid: Boolean;
-            AShowDebugBounds: Boolean;
-            Const ATextHint: String);
-
-        Procedure DrawCaret(
-            ACanvas: TCanvas;
-            Const ALayout: TRotatedEditLayoutResult;
-            Const AColors: TRotatedEditStyleColors;
-            ACaretVisible: Boolean);
-    End;
+  The factory keeps the component core independent from concrete rendering
+  units. The core requests a backend kind; the factory owns the knowledge of
+  which implementation class must be instantiated.
+}
+Function CreateRotatedEditRenderBackend(
+    ABackendKind: TRotatedEditRenderBackendKind): IRotatedEditRenderBackend;
 
 Implementation
 
 Uses
-    VclRotatedEdit_Render;
+    VclRotatedEdit_RenderBackend_GDI,
+    VclRotatedEdit_RenderBackend_Direct2D;
 
-Function TRotatedEditGDIRenderBackend.GetBackendName: String;
+Function CreateRotatedEditRenderBackend(
+    ABackendKind: TRotatedEditRenderBackendKind): IRotatedEditRenderBackend;
 Begin
-    Result := 'GDI';
-End;
+    Case ABackendKind Of
+        rebGDI:
+            Result := TRotatedEditGDIRenderBackend.Create;
 
-Function TRotatedEditGDIRenderBackend.BuildLayout(
-    ACanvas: TCanvas;
-    Const AInput: TRotatedEditLayoutInput): TRotatedEditLayoutResult;
-Begin
-    Result := TRotatedEditLayout.BuildLayout(
-        ACanvas,
-        AInput);
-End;
-
-Function TRotatedEditGDIRenderBackend.HitTest(
-    ACanvas: TCanvas;
-    Const ALayout: TRotatedEditLayoutResult;
-    Const AActualPoint: TPoint): TRotatedEditHitTestResult;
-Begin
-    Result := TRotatedEditLayout.HitTest(
-        ACanvas,
-        ALayout,
-        AActualPoint);
-End;
-
-Procedure TRotatedEditGDIRenderBackend.DrawContent(
-    ACanvas: TCanvas;
-    Const ALayout: TRotatedEditLayoutResult;
-    Const AColors: TRotatedEditStyleColors;
-    ABackgroundBitmap: TBitmap;
-    Var ABackgroundBitmapValid: Boolean;
-    AContentBitmap: TBitmap;
-    Var AContentBitmapValid: Boolean;
-    AShowDebugBounds: Boolean;
-    Const ATextHint: String);
-Begin
-    TRotatedEditRenderer.DrawContent(
-        ACanvas,
-        ALayout,
-        AColors,
-        ABackgroundBitmap,
-        ABackgroundBitmapValid,
-        AContentBitmap,
-        AContentBitmapValid,
-        AShowDebugBounds,
-        ATextHint);
-End;
-
-Procedure TRotatedEditGDIRenderBackend.DrawCaret(
-    ACanvas: TCanvas;
-    Const ALayout: TRotatedEditLayoutResult;
-    Const AColors: TRotatedEditStyleColors;
-    ACaretVisible: Boolean);
-Begin
-    TRotatedEditRenderer.DrawCaret(
-        ACanvas,
-        ALayout,
-        AColors,
-        ACaretVisible);
+        rebDirect2D:
+            Begin
+                //-------------------------------------------------------------
+                //The Direct2D backend is selected through its own unit so the
+                //Direct2D/DirectWrite dependencies stay isolated from the
+                //component core and from the GDI implementation. The backend
+                //itself owns its GDI fallback and uses it only when native
+                //Direct2D resources or a Direct2D drawing pass fail.
+                //-------------------------------------------------------------
+                Result := TRotatedEditDirect2DRenderBackend.Create;
+            End;
+    Else
+        Result := TRotatedEditGDIRenderBackend.Create;
+    End;
 End;
 
 End.

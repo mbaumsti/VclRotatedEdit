@@ -66,6 +66,13 @@ Type
         SelStart: Integer;
         SelLength: Integer;
 
+        //-----------------------------------------------------------------
+        //Visual selection switch for the current layout pass. The stored
+        //selection range remains in SelStart/SelLength even when this flag is
+        //False; renderers simply receive no selection geometry to paint.
+        //-----------------------------------------------------------------
+        SelectionVisible: Boolean;
+
         CaretThickness: Integer;
 
         Alignment: TAlignment;
@@ -94,9 +101,28 @@ Type
             Const ACanonicalEditRect: TRect;
             AAngle: Double): TRotatedEditFloatPoint; Static;
 
+        Class Function IsOrthogonalAngle(
+            AAngle: Double): Boolean; Static;
+
+        Class Function CreateRotationSafeMeasurementFont(
+            ACanvas: TCanvas;
+            AAngle: Double): HFONT; Static;
+
+        Class Procedure BeginMeasurementWorldTransform(
+            ACanvas: TCanvas;
+            AAngle: Double;
+            Out ASavedXForm: TXForm;
+            Out ASavedGraphicsMode: Integer); Static;
+
+        Class Procedure EndMeasurementWorldTransform(
+            ACanvas: TCanvas;
+            Const ASavedXForm: TXForm;
+            ASavedGraphicsMode: Integer); Static;
+
         Class Procedure BuildTextAdvances(
             ACanvas: TCanvas;
             Const AText: String;
+            AAngle: Double;
             Out AAdvances: TArray<Integer>;
             Out ATextSize: TSize); Static;
 
@@ -123,13 +149,15 @@ Type
         {
           Converts a text index to a canonical flow coordinate.
 
-          V1 uses TextWidth(Copy(Text, 1, Index)). Later versions may cache
-          per-character advances, but the rule must remain the same.
+          caret positions are measured from successive complete
+          text prefixes in the same GDI font/transform policy as the rotated
+          TextOut renderer.
         }
         Class Function TextIndexToCanonicalFlow(
             ACanvas: TCanvas;
             Const AText: String;
-            AIndex: Integer): Double; Static;
+            AIndex: Integer;
+            AAngle: Double = 0.0): Double; Static;
 
         {
           Converts a canonical flow coordinate to an insertion index.
@@ -141,7 +169,8 @@ Type
         Class Function CanonicalFlowToTextIndex(
             ACanvas: TCanvas;
             Const AText: String;
-            AFlow: Double): Integer; Static;
+            AFlow: Double;
+            AAngle: Double = 0.0): Integer; Static;
 
         {
           Ensures that the caret remains visible along the canonical flow axis.
@@ -154,7 +183,8 @@ Type
             Const AText: String;
             ACaretIndex: Integer;
             ACurrentScrollOffset: Integer;
-            Const ACanonicalContentRect: TRect): Integer; Static;
+            Const ACanonicalContentRect: TRect;
+            AAngle: Double = 0.0): Integer; Static;
 
         {
           Builds canonical and actual caret geometry.
@@ -280,41 +310,191 @@ Begin
         LClientCenterY - LBoundsCenterY);
 End;
 
+Class Function TRotatedEditLayout.IsOrthogonalAngle(
+    AAngle: Double): Boolean;
+Var
+    LAngle: Double;
+    LNearestQuarter: Double;
+Begin
+    //-------------------------------------------------------------------------
+    //Returns True for the four angles where the original font quality can be
+    //kept. This intentionally mirrors the GDI renderer rule: non-orthogonal
+    //angles use a rotation-safe grayscale antialiased font, while orthogonal
+    //angles keep the source font quality.
+    //-------------------------------------------------------------------------
+    LAngle := TRotatedEditGeometry.NormalizeAngle(AAngle);
+    LNearestQuarter := Round(LAngle / 90.0) * 90.0;
+
+    Result := Abs(LAngle - LNearestQuarter) < 0.001;
+End;
+
+Class Function TRotatedEditLayout.CreateRotationSafeMeasurementFont(
+    ACanvas: TCanvas;
+    AAngle: Double): HFONT;
+Var
+    LLogFont: TLogFont;
+Begin
+    //-------------------------------------------------------------------------
+    //Creates the measurement font used by caret, selection, scrolling and
+    //hit-testing.
+    //
+    //Important rule
+    //--------------
+    //This helper must remain aligned with
+    //TRotatedEditGDIRenderer.CreateRotationSafeFont. The renderer draws text
+    //with a temporary unrotated HFONT and lets the world transform own the
+    //rotation. For arbitrary angles it also disables ClearType and requests
+    //ANTIALIASED_QUALITY. If the layout measures with ACanvas.Font directly,
+    //the caret can drift progressively away from the rendered text.
+    //
+    //The duplication is deliberate for now: the layout unit must not depend on
+    //the concrete GDI renderer unit, but both sides need the same GDI font
+    //policy until the backend owns text metrics explicitly.
+    //-------------------------------------------------------------------------
+    Result := 0;
+
+    FillChar(
+        LLogFont,
+        SizeOf(LLogFont),
+        0);
+
+    If GetObject(
+        ACanvas.Font.Handle,
+        SizeOf(LLogFont),
+        @LLogFont) = 0 Then
+        Exit;
+
+    LLogFont.lfEscapement := 0;
+    LLogFont.lfOrientation := 0;
+
+    If Not IsOrthogonalAngle(AAngle) Then
+        LLogFont.lfQuality := ANTIALIASED_QUALITY;
+
+    Result := CreateFontIndirect(LLogFont);
+End;
+
+Class Procedure TRotatedEditLayout.BeginMeasurementWorldTransform(
+    ACanvas: TCanvas;
+    AAngle: Double;
+    Out ASavedXForm: TXForm;
+    Out ASavedGraphicsMode: Integer);
+Var
+    LRad: Double;
+    LCos: Double;
+    LSin: Double;
+    LXForm: TXForm;
+Begin
+    //-------------------------------------------------------------------------
+    //Applies the same GDI advanced transform model as the final text renderer
+    //while measuring text prefixes.
+    //
+    //The measured value we keep is still the canonical flow width returned by
+    //GetTextExtentPoint32, but the selected DC state now matches the real
+    //TextOut path as closely as possible: GM_ADVANCED is enabled, the same
+    //rotation sign convention is used, and the rotation-safe HFONT is selected
+    //before this method is called.
+    //-------------------------------------------------------------------------
+    ASavedGraphicsMode := SetGraphicsMode(
+        ACanvas.Handle,
+        GM_ADVANCED);
+
+    GetWorldTransform(
+        ACanvas.Handle,
+        ASavedXForm);
+
+    LRad := -AAngle * Pi / 180.0;
+    LCos := Cos(LRad);
+    LSin := Sin(LRad);
+
+    LXForm.eM11 := LCos;
+    LXForm.eM12 := LSin;
+    LXForm.eM21 := -LSin;
+    LXForm.eM22 := LCos;
+    LXForm.eDx := 0.0;
+    LXForm.eDy := 0.0;
+
+    SetWorldTransform(
+        ACanvas.Handle,
+        LXForm);
+End;
+
+Class Procedure TRotatedEditLayout.EndMeasurementWorldTransform(
+    ACanvas: TCanvas;
+    Const ASavedXForm: TXForm;
+    ASavedGraphicsMode: Integer);
+Begin
+    SetWorldTransform(
+        ACanvas.Handle,
+        ASavedXForm);
+
+    SetGraphicsMode(
+        ACanvas.Handle,
+        ASavedGraphicsMode);
+End;
+
 Class Procedure TRotatedEditLayout.BuildTextAdvances(
     ACanvas: TCanvas;
     Const AText: String;
+    AAngle: Double;
     Out AAdvances: TArray<Integer>;
     Out ATextSize: TSize);
 Var
-    LFit:        Integer;
+    I:           Integer;
     LTextLength: Integer;
-    LOk:         Boolean;
+    LPrefix:             String;
+    LPrefixSize:         TSize;
+    LOk:                 Boolean;
+    LFont:               HFONT;
+    LOldFont:            HGDIOBJ;
+    LSavedXForm:         TXForm;
+    LSavedGraphicsMode:  Integer;
+    LWorldTransformOpen: Boolean;
 Begin
     //-------------------------------------------------------------------------
-    //Builds cumulative character advances for a complete text run.
+    //Builds cumulative caret positions for a complete text run.
     //
     //Why this method exists
     //----------------------
-    //A rotated edit control makes small metric differences very visible.
+    //A rotated edit control makes text metric differences very visible. When the
+    //control is displayed at a free angle such as 45 degrees, even a small
+    //difference along the canonical text-flow axis is projected on both screen
+    //axes and appears as a visible caret drift.
     //
-    //The renderer draws the whole text with GDI TextOut. If the layout places
-    //the caret using TextWidth(Copy(Text, 1, Index)), the caret can slowly drift
-    //away from the visually rendered glyphs because each prefix measurement may
-    //round slightly differently from the full rendered text run.
+    //Important rule
+    //-------------------
+    //Each caret position is measured from the complete prefix that precedes the
+    //insertion point, but now the measurement DC is also aligned with the final
+    //rotated GDI TextOut path:
     //
-    //GetTextExtentExPoint returns cumulative advances for the complete string in
-    //one GDI call. Those advances are therefore a better source for:
-    //- caret X position;
-    //- selection geometry;
-    //- hit-testing by character midpoint;
-    //- scroll-to-caret calculations.
+    //  - same source LOGFONT;
+    //  - same ClearType avoidance policy for arbitrary angles;
+    //  - same GM_ADVANCED/world-transform model;
+    //  - same unrotated HFONT with rotation owned by the transform.
     //
-    //Important limitation
+    //A prefix-only correction was not sufficient because it still used
+    //the normal canvas font/context while the renderer used a rotation-safe
+    //temporary HFONT. That produced a cumulative drift: on a 28-character text,
+    //the caret could end almost one character away from the visible text end.
+    //
+    //Cost model
+    //----------
+    //This is O(n²) because each prefix is measured as a string. TRotatedEdit is
+    //currently a single-line edit control, so this cost is acceptable and the
+    //visual correctness is more important than the small extra layout cost.
+    //
+    //Single metric source
     //--------------------
-    //This is still a GDI metric model. It does not implement Unicode shaping,
-    //surrogate pairs, ligature clusters or bidirectional text. That is
-    //acceptable for the current single-line V1 component, but this method is the
-    //place to replace if a future version moves to Uniscribe / DirectWrite.
+    //All caret placement, selection geometry, hit-testing and scroll-to-caret
+    //logic go through this method. Keeping this as the single metric source is
+    //more important than optimizing only one consumer, otherwise the caret could
+    //be fixed while selection or mouse hit-testing would still disagree.
+    //
+    //Current limitation
+    //------------------
+    //This remains a GDI metric model. It does not implement Unicode shaping,
+    //surrogate pairs, ligature clusters or bidirectional text. If a future
+    //DirectWrite backend owns text layout, this method is the place where the GDI
+    //metric policy can be replaced by backend-owned caret stops.
     //-------------------------------------------------------------------------
     LTextLength := Length(AText);
 
@@ -328,30 +508,78 @@ Begin
     If LTextLength = 0 Then
         Exit;
 
-    LFit := 0;
+    LOk := True;
+    LFont := 0;
+    LOldFont := 0;
+    LWorldTransformOpen := False;
 
-    LOk := GetTextExtentExPoint(
-        ACanvas.Handle,
-        PChar(AText),
-        LTextLength,
-        MaxInt,
-        @LFit,
-        @AAdvances[0],
-        ATextSize);
+    LFont := CreateRotationSafeMeasurementFont(
+        ACanvas,
+        AAngle);
+
+    If LFont <> 0 Then
+        LOldFont := SelectObject(
+            ACanvas.Handle,
+            LFont);
+
+    Try
+        BeginMeasurementWorldTransform(
+            ACanvas,
+            AAngle,
+            LSavedXForm,
+            LSavedGraphicsMode);
+        LWorldTransformOpen := True;
+
+        For I := 1 To LTextLength Do Begin
+            LPrefix := Copy(
+                AText,
+                1,
+                I);
+
+            If GetTextExtentPoint32(
+                ACanvas.Handle,
+                PChar(LPrefix),
+                Length(LPrefix),
+                LPrefixSize) Then Begin
+                AAdvances[I - 1] := LPrefixSize.cx;
+
+                If I = LTextLength Then
+                    ATextSize := LPrefixSize;
+            End
+            Else Begin
+                LOk := False;
+                Break;
+            End;
+        End;
+    Finally
+        If LWorldTransformOpen Then
+            EndMeasurementWorldTransform(
+                ACanvas,
+                LSavedXForm,
+                LSavedGraphicsMode);
+
+        If LOldFont <> 0 Then
+            SelectObject(
+                ACanvas.Handle,
+                LOldFont);
+
+        If LFont <> 0 Then
+            DeleteObject(LFont);
+    End;
 
     If Not LOk Then Begin
         //---------------------------------------------------------------------
         //Fallback path.
         //
         //This should rarely be used, but keeping a deterministic fallback is
-        //safer than returning a half-built advance table. The fallback preserves
-        //the old behavior and is therefore acceptable as degraded mode.
+        //safer than returning a partially-built advance table. The fallback uses
+        //TCanvas text metrics because they are always available through VCL.
         //---------------------------------------------------------------------
         ATextSize.cx := ACanvas.TextWidth(AText);
         ATextSize.cy := ACanvas.TextHeight('Wg');
 
-        For LFit := 1 To LTextLength Do
-            AAdvances[LFit - 1] := ACanvas.TextWidth(Copy(AText, 1, LFit));
+        For I := 1 To LTextLength Do
+            AAdvances[I - 1] := ACanvas.TextWidth(Copy(AText, 1, I));
     End;
 End;
 
@@ -557,6 +785,8 @@ Begin
     //intentionally not corrected in DrawText: local renderer offsets would make
     //the caret and mouse hit-test drift away from the text.
     //-------------------------------------------------------------------------
+    Result.BorderMetrics := LBorderMetrics;
+
     Result.CanonicalContentRect := Rect(
         LBorderMetrics.Left + AInput.PaddingLeft,
         LBorderMetrics.Top + AInput.PaddingTop,
@@ -570,12 +800,19 @@ Begin
         Result.CanonicalContentRect.Bottom := Result.CanonicalContentRect.Top;
 
     Result.Text := AInput.Text;
+    Result.SelStart := AInput.SelStart;
+    Result.SelLength := AInput.SelLength;
+    Result.SelectionVisible := AInput.SelectionVisible;
     //-------------------------------------------------------------------------
     //TextLength / TextThickness are layout estimates used by rendering and
     //scrolling. TextLength is resolved through the same cumulative-advance
     //policy as caret placement so long text and rotated text do not drift.
     //-------------------------------------------------------------------------
-    Result.TextLength := Round(TextIndexToCanonicalFlow(ACanvas, AInput.Text, Length(AInput.Text)));
+    Result.TextLength := Round(TextIndexToCanonicalFlow(
+        ACanvas,
+        AInput.Text,
+        Length(AInput.Text),
+        AInput.Angle));
 
     //-------------------------------------------------------------------------
     //GDI text metric rule.
@@ -678,7 +915,8 @@ Begin
         AInput.Text,
         AInput.CaretIndex,
         AInput.ScrollOffset,
-        Result.CanonicalContentRect);
+        Result.CanonicalContentRect,
+        Result.Angle);
 
     //---------------------------------------------------------------------
     //Horizontal alignment and padding rule.
@@ -784,17 +1022,21 @@ Begin
         AInput.CaretIndex,
         AInput.CaretThickness);
 
-    Result.SelectionQuads := BuildSelectionGeometry(
-        ACanvas,
-        Result,
-        AInput.SelStart,
-        AInput.SelLength);
+    If Result.SelectionVisible Then
+        Result.SelectionQuads := BuildSelectionGeometry(
+            ACanvas,
+            Result,
+            AInput.SelStart,
+            AInput.SelLength)
+    Else
+        SetLength(Result.SelectionQuads, 0);
 End;
 
 Class Function TRotatedEditLayout.TextIndexToCanonicalFlow(
     ACanvas: TCanvas;
     Const AText: String;
-    AIndex: Integer): Double;
+    AIndex: Integer;
+    AAngle: Double): Double;
 Var
     LIndex:    Integer;
     LAdvances: TArray<Integer>;
@@ -803,14 +1045,14 @@ Begin
     //-------------------------------------------------------------------------
     //Converts a text insertion index to a canonical flow coordinate.
     //
-    //This method is deliberately based on GetTextExtentExPoint through
-    //BuildTextAdvances instead of TextWidth(Copy(...)).
+    //This method is deliberately based on BuildTextAdvances, whose current policy
+    //measures each complete text prefix in the rotated GDI measurement context.
     //
     //Reason:
-    //The text renderer draws the complete string. If caret placement is measured
-    //from independently-rendered prefixes, tiny rounding differences can
-    //accumulate. At arbitrary angles those tiny differences become visible as a
-    //caret drift that appears to grow with the distance from the text origin.
+    //The text renderer draws text as GDI text runs. If caret placement is derived
+    //from a different advance model, tiny metric differences can accumulate. At
+    //arbitrary angles those differences become visible as a caret drift that
+    //appears to grow with the distance from the text origin.
     //
     //All code that needs "where is index N?" must go through this method so the
     //metric policy remains centralized.
@@ -831,6 +1073,7 @@ Begin
     BuildTextAdvances(
         ACanvas,
         AText,
+        AAngle,
         LAdvances,
         LTextSize);
 
@@ -842,7 +1085,8 @@ End;
 Class Function TRotatedEditLayout.CanonicalFlowToTextIndex(
     ACanvas: TCanvas;
     Const AText: String;
-    AFlow: Double): Integer;
+    AFlow: Double;
+    AAngle: Double): Integer;
 Var
     I:         Integer;
     LLeft:     Double;
@@ -861,8 +1105,8 @@ Begin
     //
     //Metric rule:
     //The midpoint calculation uses the same advance table as
-    //TextIndexToCanonicalFlow. Never mix TextWidth(Copy(...)) here, otherwise
-    //mouse hit-testing and caret rendering can disagree.
+    //TextIndexToCanonicalFlow. Never use a different prefix/advance policy here,
+    //otherwise mouse hit-testing and caret rendering can disagree.
     //-------------------------------------------------------------------------
     Result := 0;
 
@@ -875,6 +1119,7 @@ Begin
     BuildTextAdvances(
         ACanvas,
         AText,
+        AAngle,
         LAdvances,
         LTextSize);
 
@@ -903,7 +1148,8 @@ Class Function TRotatedEditLayout.EnsureCaretVisible(
     Const AText: String;
     ACaretIndex: Integer;
     ACurrentScrollOffset: Integer;
-    Const ACanonicalContentRect: TRect): Integer;
+    Const ACanonicalContentRect: TRect;
+    AAngle: Double): Integer;
 Var
     LCaretFlow:    Double;
     LVisibleLeft:  Double;
@@ -920,7 +1166,8 @@ Begin
     LCaretFlow := TextIndexToCanonicalFlow(
         ACanvas,
         AText,
-        ACaretIndex);
+        ACaretIndex,
+        AAngle);
 
     LVisibleLeft := Result;
     LVisibleRight := Result + ACanonicalContentRect.Width - (2 * LMargin);
@@ -947,7 +1194,8 @@ Begin
     LCaretFlow := TextIndexToCanonicalFlow(
         ACanvas,
         ALayout.Text,
-        ACaretIndex);
+        ACaretIndex,
+        ALayout.Angle);
 
     Result.Index := ACaretIndex;
     Result.Flow := ALayout.TextOriginCanonical.X + LCaretFlow;
@@ -1065,13 +1313,15 @@ Begin
         TextIndexToCanonicalFlow(
             ACanvas,
             ALayout.Text,
-            LSelStart);
+            LSelStart,
+            ALayout.Angle);
 
     LFlowEnd := ALayout.TextOriginCanonical.X +
         TextIndexToCanonicalFlow(
             ACanvas,
             ALayout.Text,
-            LSelEnd);
+            LSelEnd,
+            ALayout.Angle);
 
     LCanonicalQuad.P1 := TRotatedEditFloatPoint.Create(
         LFlowStart,
@@ -1126,7 +1376,8 @@ Begin
     Result.InsertionIndex := CanonicalFlowToTextIndex(
         ACanvas,
         ALayout.Text,
-        LFlow);
+        LFlow,
+        ALayout.Angle);
 End;
 
 End.

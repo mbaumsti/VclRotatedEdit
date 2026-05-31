@@ -125,60 +125,48 @@ RENDERING BACKEND BOUNDARY
 --------------------------
 
 Rendering and text-metric dependent operations pass through
-IRotatedEditRenderBackend. The current implementation is the historical GDI
-backend. The contract deliberately includes layout and hit-testing, not only
-drawing, so a future Direct2D/DirectWrite backend can compute text positions,
-caret placement and selection geometry with the same engine that renders the
-text.
+IRotatedEditRenderBackend. The component currently provides two backends:
 
-EDITING API
------------
+  rebDirect2D
+      Default Direct2D / DirectWrite renderer used when native resources are
+      available. It draws in the final oriented coordinate system.
 
-The public API includes common edit-control operations:
+  rebGDI
+      Historical renderer kept as an explicit compatibility backend and safety
+      fallback.
 
-  Clear
-      Clears the whole text.
+The backend contract includes layout and hit-testing, not only drawing, because
+editable text requires drawing, caret placement, selection geometry and
+hit-testing to stay metrically coherent.
 
-  ClearSelection
-      Removes the current selection without using the clipboard.
+DIRECT2D ARCHITECTURE RULE
+--------------------------
 
-  SelectAll
-      Selects the whole text.
+The Direct2D backend draws in the final oriented coordinate system of the
+control. It must not draw a straight edit into a bitmap and rotate or project
+that bitmap afterwards. If a double buffer is needed, the buffer must already
+represent the final oriented control surface.
 
-  CopyToClipboard
-      Copies the current selection to the clipboard.
+This rule avoids the edge artefacts that can appear when already-rasterized GDI
+content is projected to a shallow angle.
 
-  CutToClipboard
-      Cuts the current selection to the clipboard when the control is not
-      read-only.
+CURRENT RENDERING STATE
+-----------------------
 
-  PasteFromClipboard
-      Inserts clipboard text at the caret position or replaces the current
-      selection.
+The GDI backend remains available and is used as a fallback if Direct2D /
+DirectWrite resources cannot be created or if a Direct2D drawing operation
+fails.
 
-  SelText
-      Returns the selected text. Assigning SelText replaces the current
-      selection or inserts text at the current caret position.
+The Direct2D backend owns the Direct2D factory, DirectWrite factory and DC render
+target. It draws the background, frame, text, selection and caret. DirectWrite is
+used for native text positions used by selection and caret placement.
 
+The selection is logically preserved when the control loses focus, but the visual
+highlight is hidden while the control is not focused.
 
+MAINTENANCE NOTES
+-----------------
 
-
-DESIGN-TIME CURSOR PROPERTY
----------------------------
-
-The inherited Cursor property is hidden from the Object Inspector by the
-design-time registration unit. TRotatedEdit manages its own orientation-aware
-I-beam cursor, so a fixed design-time Cursor value would be misleading. The
-inherited runtime property still exists because it belongs to TControl.
-
-DOCUMENTATION SCOPE
--------------------
-
-This documentation covers the component source units only.
-
-It intentionally excludes:
-
-  - demo sources;
-  - Delphi history folders;
-  - backup or copy files;
-  - generated binary files.
+Source comments should describe current responsibilities and invariants rather
+than internal revision history. Historical experiments should not be preserved in
+public-facing documentation unless they explain an active architectural rule.

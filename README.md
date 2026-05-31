@@ -31,6 +31,7 @@ The component is designed for VCL applications that need editable labels, compac
 - Caret, selection and mouse hit-testing aligned with the rotated text flow.
 - Clipboard and selection support: copy, cut, paste, select all, selected-text replacement and clear selection.
 - `ReadOnly`, `MaxLength`, `CharCase`, `NumbersOnly`, `TextHint` and alignment support.
+- `RenderBackend` property for selecting the rendering backend. `rebDirect2D` is the default renderer and uses Direct2D / DirectWrite when native resources are available; `rebGDI` keeps the historical GDI renderer available for compatibility and fallback.
 - VCL style-aware rendering through `PaletteMode` and `StyleElements`.
 - Style-derived border metrics so the editable area follows the active VCL style instead of assuming a fixed one-pixel border.
 - Design-time selection markers for shaped/rotated controls.
@@ -278,7 +279,9 @@ end;
 - `VclRotatedEdit_Geometry.pas`: projection and angle helpers.
 - `VclRotatedEdit_Layout.pas`: canonical text/caret/selection layout.
 - `VclRotatedEdit_Render.pas`: historical GDI owner-drawn rendering pipeline.
-- `VclRotatedEdit_RenderBackend.pas`: rendering and text-metric backend contract, currently implemented by the GDI backend and prepared for Direct2D/DirectWrite.
+- `VclRotatedEdit_RenderBackend.pas`: common rendering and text-metric backend contract plus backend factory.
+- `VclRotatedEdit_RenderBackend_GDI.pas`: historical GDI backend implementation.
+- `VclRotatedEdit_RenderBackend_Direct2D.pas`: Direct2D/DirectWrite backend implementation with a private GDI fallback for native-resource or drawing failures.
 - `VclRotatedEdit_Style.pas`: style, color and border-metric resolution.
 - `VclRotatedEdit_EditEngine.pas`: pure text mutation engine.
 - `VclRotatedEdit_Caret.pas`: caret blink controller.
@@ -327,36 +330,15 @@ If your PasDoc version does not support `@` response files, use the fallback com
 
 ---
 
-## Recent changes in version 1.0.2
+## Current development state
 
-This release is a compatibility attempt for Delphi 10.2.3 while preserving the style behavior validated on newer Delphi versions.
+The source tree currently contains two rendering backends:
 
-- Added conditional compilation guards around newer per-control VCL style APIs.
-- `TControl.StyleName` is now published and passed to the style resolver only when the compiler is new enough to support per-control styling.
-- `StyleServices(Control)` / `StyleServices(Parent)` calls are now used only on newer Delphi versions; older compilers fall back to the global `StyleServices`.
-- Delphi 10.2.3 should therefore keep normal application-level VCL style support, without per-control `StyleName` support.
-- Performed a compatibility scan for common newer Delphi syntax patterns such as inline variable declarations and `.ToString` calls. No such usage was found in the source units.
+- `rebDirect2D`: the default Direct2D / DirectWrite renderer. It draws in the final oriented coordinate system and avoids projecting an already-rasterized straight bitmap.
+- `rebGDI`: the historical GDI renderer, kept as an explicit compatibility backend and as the fallback path used when Direct2D cannot be used.
 
-## Previous changes in version 1.0.1
+The Direct2D backend owns the native Direct2D factory, DirectWrite factory and DC render target. It draws the background, frame, selection, text and caret without using a straight bitmap that is rotated afterwards. This rule is intentional: rendering directly in the final coordinate system avoids the edge artefacts caused by projecting already-rasterized GDI bitmaps.
 
-This release was intended as a corrective release before the Direct2D/DirectWrite work continues.
+The Direct2D renderer is the recommended/default path for normal use. The GDI renderer remains useful for compatibility, troubleshooting and as a safety fallback. The Direct2D backend delegates to it when native resources are unavailable or when a Direct2D operation fails.
 
-- Kept the validated GDI arbitrary-angle text fix: text is no longer rendered as ClearType into a horizontal bitmap and then rotated.
-- Kept the style-aware border metric fix: layout now uses the real VCL-style edit content margins instead of assuming a fixed one-pixel border.
-- Kept the visual text-centering fix based on the visible `W` glyph band.
-- Kept the validated `AutoSize` behavior for `LogicalThickness`, using a native `TEdit` probe in the same parent/style context.
-- Added design-time hiding of the inherited `Cursor` property with `UnlistPublishedProperty`, because the component manages its own orientation-aware cursor.
-- Updated PasDoc support files so `VclRotatedEdit_RenderBackend.pas` is included in the generated API documentation.
-- Updated README/API documentation notes to describe `AutoSize`, backend separation, style border metrics and the hidden `Cursor` design-time property.
-
----
-
-## Compatibility notes
-
-The code follows a classic Delphi style:
-
-- no inline variable declarations;
-- variables are declared in explicit `var` blocks;
-- comments are intentionally detailed to help maintenance and PasDoc generation.
-
-The component was stabilized with Delphi 12.2 behavior in mind, especially around VCL styles and design-time form streaming.
+The demo event monitor stores event counters in memory and coalesces visual grid refreshes to avoid flicker while keeping all event counts exact.

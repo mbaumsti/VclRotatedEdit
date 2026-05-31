@@ -57,7 +57,7 @@ Type
         //-----------------------------------------------------------------
         //Style service selected for this control.
         //
-        //Runtime keeps the existing v76 behavior because it already resolves
+        //Runtime keeps the established behavior because it already resolves
         //the expected application colors. Design-time can use a different
         //style service source, resolved from the parent/control context, to
         //match the form designer more closely.
@@ -89,7 +89,7 @@ Type
 
           Delphi 12.2 note:
           ThemeServices does not provide a Handle overload. Runtime keeps the
-          existing v76 style-service order because it already works. Design-time
+          existing style-service order because it already works. Design-time
           first tries the parent/control StyleServices context because the global
           active style can be the IDE/default Windows context instead of the
           style selected for the current project form.
@@ -158,7 +158,7 @@ Begin
     //instances, the renderer could draw one frame while the layout reserves the
     //insets of another. That would reintroduce vertical/cross-axis offsets.
     //
-    //Runtime keeps the existing v76 order. Design-time still prefers the
+    //Runtime keeps the existing style-service order. Design-time still prefers the
     //parent/control context so a component dropped on a styled form follows the
     //designer surface rather than the IDE/global style.
     //-------------------------------------------------------------------------
@@ -265,8 +265,8 @@ Begin
         //---------------------------------------------------------------------
         //Resolve the style service that belongs to this control.
         //
-        //Important v77 rule:
-        //- runtime keeps the v76 resolution sequence unchanged because it
+        //Important rule:
+        //- runtime keeps the established resolution sequence unchanged because it
         //  already returns the expected application colors;
         //- design-time avoids TStyleManager.ActiveStyle as the first source
         //  because the component code runs inside the IDE/design package
@@ -449,7 +449,7 @@ Begin
     //would reserve a two-pixel 3D client edge that the renderer does not draw.
     //
     //The system metrics are still read as a documented fallback reference for
-    //future changes, but the active v1 fallback remains the actual pen width.
+    //future changes, but the active fallback remains the actual pen width.
     //-------------------------------------------------------------------------
     LEdgeX := GetSystemMetrics(SM_CXEDGE);
     LEdgeY := GetSystemMetrics(SM_CYEDGE);

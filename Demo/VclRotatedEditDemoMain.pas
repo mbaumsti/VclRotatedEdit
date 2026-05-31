@@ -23,7 +23,10 @@
   La grille d'événements sert volontairement de documentation interactive : elle
   affiche les événements disponibles et incrémente un compteur chaque fois qu'un
   événement est déclenché. Les événements bruyants, comme OnMouseMove, restent
-  connectés afin de permettre une vérification immédiate du comportement VCL.
+  connectés afin de permettre une vérification immédiate du comportement VCL,
+  mais le rafraîchissement visuel de la grille est coalescé pour éviter que
+  la démonstration elle-même ne repeigne toute la fiche à chaque frappe, à
+  chaque déplacement souris ou à chaque notification répétitive.
 }
 
 Unit VclRotatedEditDemoMain;
@@ -46,6 +49,16 @@ Uses
     VclRotatedEdit_Types,
     VclRotatedEdit_Core,
     Vcl.ComCtrls;
+
+Const
+    //--------------------------------------------------------------------------
+    //Private demo-form message used to coalesce visual event-grid refreshes.
+    //
+    //A timer would solve delayed repainting, but it would also create the exact
+    //kind of heartbeat/battement that the demo must avoid. Posting a private
+    //message keeps updates event-driven: if nothing happens, nothing repaints.
+    //--------------------------------------------------------------------------
+    CWM_REFRESH_EVENT_GRID = WM_APP + 137;
 
 Type
     TRotatedEditDemoForm = Class(TForm)
@@ -147,9 +160,27 @@ Type
         //available on TRotatedEdit, and the counter column proves immediately
         //that each handler is reachable.
         //---------------------------------------------------------------------
+        FEventCounts: TArray<Integer>;
+        FEventLastTimes: TArray<String>;
+        FEventLastDetails: TArray<String>;
+        FEventGridRefreshPending: Boolean;
+        FEventGridRefreshScheduled: Boolean;
+        FEventGridDirty: Boolean;
+        FLastEventGridRefreshTick: Cardinal;
+        FLastSelectionSender: TObject;
+        FLastSelectionCaretIndex: Integer;
+        FLastSelectionStart: Integer;
+        FLastSelectionLength: Integer;
+        FLastSelectionValid: Boolean;
+
         Procedure InitializeEventGrid;
         Procedure ResetEventCounters;
+        Function FindEventIndex(Const AEventName: String): Integer;
         Function FindEventRow(Const AEventName: String): Integer;
+        Function IsThrottledEvent(Const AEventName: String): Boolean;
+        Procedure ScheduleEventGridRefresh;
+        Procedure RefreshEventGrid(AForceRedraw: Boolean);
+        Procedure RefreshEventGridRow(AEventIndex: Integer);
         Procedure TrackEvent(
             Const AEventName: String;
             Const ADetails: String = '');
@@ -157,6 +188,7 @@ Type
         Function MouseButtonToText(AButton: TMouseButton): String;
         Function ShiftStateToText(AShift: TShiftState): String;
         Function EditingDoneReasonToText(AReason: TRotatedEditEditingDoneReason): String;
+        Procedure WMRefreshEventGrid(Var Message: TMessage); message CWM_REFRESH_EVENT_GRID;
     End;
 
 Var
@@ -170,6 +202,15 @@ Const
     CEventNames: Array[0..21] Of String = ('OnCanChange', 'OnChange', 'OnClick', 'OnContextPopup', 'OnDblClick', 'OnEditingDone', 'OnEditingStart', 'OnEnter', 'OnExit',
         'OnKeyDown', 'OnKeyPress', 'OnKeyUp', 'OnMouseDown', 'OnMouseEnter', 'OnMouseLeave', 'OnMouseMove', 'OnMouseUp', 'OnMouseWheel', 'OnMouseWheelDown', 'OnMouseWheelUp',
         'OnSelectionChange', 'OnValidate');
+
+    //--------------------------------------------------------------------------
+    //The demo intentionally keeps noisy events connected. Without throttling,
+    //OnMouseMove can update the TStringGrid hundreds of times per second, which
+    //makes the form flicker and hides the actual component behavior being
+    //demonstrated. The counters are still updated for every event; only the
+    //visual grid refresh is limited.
+    //--------------------------------------------------------------------------
+    CEventGridRefreshIntervalMs = 250;
 
 Procedure TRotatedEditDemoForm.CustomAngleEditCanChange(
     Sender: TObject;
@@ -382,6 +423,26 @@ Var
 Begin
     LEdit := TRotatedEdit(Sender);
 
+    //-------------------------------------------------------------------------
+    //Some visual operations may notify selection state more often than a human
+    //observer expects. The demo only records a selection event when the logical
+    //selection/caret state really changed. This keeps a possible caret-blink or
+    //paint-side notification from producing a permanent visual heartbeat in the
+    //event grid.
+    //-------------------------------------------------------------------------
+    If FLastSelectionValid And
+       (FLastSelectionSender = Sender) And
+       (FLastSelectionCaretIndex = LEdit.CaretIndex) And
+       (FLastSelectionStart = LEdit.SelStart) And
+       (FLastSelectionLength = LEdit.SelLength) Then
+        Exit;
+
+    FLastSelectionSender := Sender;
+    FLastSelectionCaretIndex := LEdit.CaretIndex;
+    FLastSelectionStart := LEdit.SelStart;
+    FLastSelectionLength := LEdit.SelLength;
+    FLastSelectionValid := True;
+
     TrackEvent(
         'OnSelectionChange',
         Format('%s Caret=%d SelStart=%d SelLength=%d', [SenderName(Sender), LEdit.CaretIndex, LEdit.SelStart, LEdit.SelLength]));
@@ -420,18 +481,92 @@ Begin
     End;
 End;
 
-Function TRotatedEditDemoForm.FindEventRow(Const AEventName: String): Integer;
+Function TRotatedEditDemoForm.FindEventIndex(Const AEventName: String): Integer;
 Var
-    LRow: Integer;
+    LIndex: Integer;
 Begin
     Result := -1;
 
-    For LRow := 1 To EventGrid.RowCount - 1 Do Begin
-        If SameText(EventGrid.Cells[0, LRow], AEventName) Then Begin
-            Result := LRow;
+    For LIndex := Low(CEventNames) To High(CEventNames) Do Begin
+        If SameText(CEventNames[LIndex], AEventName) Then Begin
+            Result := LIndex;
             Exit;
         End;
     End;
+End;
+
+Function TRotatedEditDemoForm.FindEventRow(Const AEventName: String): Integer;
+Var
+    LIndex: Integer;
+Begin
+    LIndex := FindEventIndex(AEventName);
+
+    If LIndex < 0 Then
+        Result := -1
+    Else
+        Result := LIndex + 1;
+End;
+
+Function TRotatedEditDemoForm.IsThrottledEvent(Const AEventName: String): Boolean;
+Begin
+    //-------------------------------------------------------------------------
+    //The event monitor must not become the source of the flicker it is supposed
+    //to help diagnose. MouseMove is the obvious noisy event, but keyboard input
+    //also raises several events for a single character: OnKeyDown, OnKeyPress,
+    //OnCanChange, OnChange, OnSelectionChange, OnValidate and OnKeyUp.
+    //
+    //The counters and details are still updated synchronously in memory. Only
+    //the visual TStringGrid repaint is coalesced. This avoids the visible "top"
+    //on every keystroke while preserving the diagnostic value of the demo.
+    //-------------------------------------------------------------------------
+    Result :=
+        SameText(AEventName, 'OnMouseMove') Or
+        SameText(AEventName, 'OnKeyDown') Or
+        SameText(AEventName, 'OnKeyPress') Or
+        SameText(AEventName, 'OnKeyUp') Or
+        SameText(AEventName, 'OnCanChange') Or
+        SameText(AEventName, 'OnChange') Or
+        SameText(AEventName, 'OnSelectionChange') Or
+        SameText(AEventName, 'OnValidate');
+End;
+
+Procedure TRotatedEditDemoForm.RefreshEventGrid(AForceRedraw: Boolean);
+Var
+    LIndex: Integer;
+Begin
+    If EventGrid.HandleAllocated And AForceRedraw Then
+        SendMessage(EventGrid.Handle, WM_SETREDRAW, 0, 0);
+
+    Try
+        For LIndex := Low(CEventNames) To High(CEventNames) Do
+            RefreshEventGridRow(LIndex);
+    Finally
+        If EventGrid.HandleAllocated And AForceRedraw Then Begin
+            SendMessage(EventGrid.Handle, WM_SETREDRAW, 1, 0);
+            EventGrid.Invalidate;
+        End;
+    End;
+
+    FEventGridRefreshPending := False;
+    FEventGridDirty := False;
+    FLastEventGridRefreshTick := GetTickCount;
+End;
+
+Procedure TRotatedEditDemoForm.RefreshEventGridRow(AEventIndex: Integer);
+Var
+    LRow: Integer;
+Begin
+    If (AEventIndex < Low(CEventNames)) Or (AEventIndex > High(CEventNames)) Then
+        Exit;
+
+    LRow := AEventIndex + 1;
+
+    EventGrid.Cells[0, LRow] := CEventNames[AEventIndex];
+    EventGrid.Cells[1, LRow] := IntToStr(FEventCounts[AEventIndex]);
+    EventGrid.Cells[2, LRow] := FEventLastTimes[AEventIndex];
+    EventGrid.Cells[3, LRow] := FEventLastDetails[AEventIndex];
+
+    FLastEventGridRefreshTick := GetTickCount;
 End;
 
 Procedure TRotatedEditDemoForm.FormCreate(Sender: TObject);
@@ -446,10 +581,29 @@ Begin
 End;
 
 Procedure TRotatedEditDemoForm.InitializeEventGrid;
-Var
-    LIndex: Integer;
-    LRow: Integer;
 Begin
+    SetLength(FEventCounts, Length(CEventNames));
+    SetLength(FEventLastTimes, Length(CEventNames));
+    SetLength(FEventLastDetails, Length(CEventNames));
+
+    FEventGridRefreshPending := False;
+    FEventGridRefreshScheduled := False;
+    FEventGridDirty := False;
+    FLastEventGridRefreshTick := 0;
+    FLastSelectionSender := Nil;
+    FLastSelectionCaretIndex := -1;
+    FLastSelectionStart := -1;
+    FLastSelectionLength := -1;
+    FLastSelectionValid := False;
+
+    //--------------------------------------------------------------------------
+    //The event grid is a diagnostic surface, not the component being tested.
+    //Double buffering and batched initialization prevent the event monitor from
+    //becoming visually noisier than TRotatedEdit itself.
+    //--------------------------------------------------------------------------
+    EventGrid.ParentDoubleBuffered := False;
+    EventGrid.DoubleBuffered := True;
+
     EventGrid.ColCount := 4;
     EventGrid.FixedCols := 0;
     EventGrid.FixedRows := 1;
@@ -465,14 +619,7 @@ Begin
     EventGrid.ColWidths[2] := 90;
     EventGrid.ColWidths[3] := 280;
 
-    For LIndex := Low(CEventNames) To High(CEventNames) Do Begin
-        LRow := LIndex + 1;
-
-        EventGrid.Cells[0, LRow] := CEventNames[LIndex];
-        EventGrid.Cells[1, LRow] := '0';
-        EventGrid.Cells[2, LRow] := '';
-        EventGrid.Cells[3, LRow] := '';
-    End;
+    ResetEventCounters;
 End;
 
 Function TRotatedEditDemoForm.MouseButtonToText(AButton: TMouseButton): String;
@@ -493,13 +640,15 @@ End;
 
 Procedure TRotatedEditDemoForm.ResetEventCounters;
 Var
-    LRow: Integer;
+    LIndex: Integer;
 Begin
-    For LRow := 1 To EventGrid.RowCount - 1 Do Begin
-        EventGrid.Cells[1, LRow] := '0';
-        EventGrid.Cells[2, LRow] := '';
-        EventGrid.Cells[3, LRow] := '';
+    For LIndex := Low(CEventNames) To High(CEventNames) Do Begin
+        FEventCounts[LIndex] := 0;
+        FEventLastTimes[LIndex] := '';
+        FEventLastDetails[LIndex] := '';
     End;
+
+    RefreshEventGrid(True);
 End;
 
 Procedure TRotatedEditDemoForm.ResetEventsButtonClick(Sender: TObject);
@@ -549,6 +698,26 @@ Begin
             1);
 End;
 
+Procedure TRotatedEditDemoForm.ScheduleEventGridRefresh;
+Begin
+    //-------------------------------------------------------------------------
+    //Mark the grid as dirty and post at most one refresh message. The message is
+    //handled later by the form message pump, which coalesces bursts of events
+    //without introducing a timer. No input event means no posted message and
+    //therefore no periodic repaint.
+    //-------------------------------------------------------------------------
+    FEventGridDirty := True;
+    FEventGridRefreshPending := True;
+
+    If FEventGridRefreshScheduled Then
+        Exit;
+
+    FEventGridRefreshScheduled := True;
+
+    If HandleAllocated Then
+        PostMessage(Handle, CWM_REFRESH_EVENT_GRID, 0, 0);
+End;
+
 Procedure TRotatedEditDemoForm.TrackBarRotationChange(Sender: TObject);
 Begin
     FreeAngleEdit.Angle := TrackBarRotation.Position;
@@ -559,24 +728,52 @@ Procedure TRotatedEditDemoForm.TrackEvent(
     Const AEventName: String;
     Const ADetails: String);
 Var
-    LRow: Integer;
-    LCount: Integer;
+    LIndex: Integer;
 Begin
-    LRow := FindEventRow(AEventName);
+    LIndex := FindEventIndex(AEventName);
 
-    If LRow < 0 Then
+    If LIndex < 0 Then
         Exit;
 
-    LCount := StrToIntDef(
-        EventGrid.Cells[1, LRow],
-        0);
-    Inc(LCount);
-
-    EventGrid.Cells[1, LRow] := IntToStr(LCount);
-    EventGrid.Cells[2, LRow] := FormatDateTime(
+    Inc(FEventCounts[LIndex]);
+    FEventLastTimes[LIndex] := FormatDateTime(
         'hh:nn:ss.zzz',
         Now);
-    EventGrid.Cells[3, LRow] := ADetails;
+    FEventLastDetails[LIndex] := ADetails;
+
+    If IsThrottledEvent(AEventName) Then Begin
+        ScheduleEventGridRefresh;
+        Exit;
+    End;
+
+    If FEventGridRefreshPending Or FEventGridDirty Then
+        RefreshEventGrid(True)
+    Else
+        RefreshEventGridRow(LIndex);
+End;
+
+Procedure TRotatedEditDemoForm.WMRefreshEventGrid(Var Message: TMessage);
+Var
+    LNowTick: Cardinal;
+Begin
+    FEventGridRefreshScheduled := False;
+
+    If Not FEventGridDirty Then
+        Exit;
+
+    LNowTick := GetTickCount;
+
+    //-------------------------------------------------------------------------
+    //Do not repaint merely because the posted message arrived. If the last
+    //visual update is too recent, keep the in-memory counters dirty and let the
+    //next real event schedule another pass. This is intentionally not a timer:
+    //there is no periodic repaint while the mouse and keyboard are idle.
+    //-------------------------------------------------------------------------
+    If (FLastEventGridRefreshTick <> 0) And
+       ((LNowTick - FLastEventGridRefreshTick) < CEventGridRefreshIntervalMs) Then
+        Exit;
+
+    RefreshEventGrid(True);
 End;
 
 End.

@@ -28,14 +28,14 @@ object RotatedEditDemoForm: TRotatedEditDemoForm
   end
   object VerticalDownLabel: TLabel
     Left = 21
-    Top = 522
+    Top = 529
     Width = 104
     Height = 17
     Caption = 'Vertical down edit'
   end
   object VerticalUpLabel: TLabel
     Left = 158
-    Top = 522
+    Top = 529
     Width = 87
     Height = 17
     Caption = 'Vertical up edit'
@@ -94,14 +94,15 @@ object RotatedEditDemoForm: TRotatedEditDemoForm
     Text = 'Native TEdit reference'
   end
   object HorizontalEdit: TRotatedEdit
-    Left = 20
-    Top = 204
+    Left = 19
+    Top = 216
     Width = 237
     Height = 25
     Cursor = crIBeam
     ParentColor = False
     TabOrder = 2
     Text = 'Horizontal editable text'
+    Orientation = reoCustomAngle
     LogicalLength = 237
     LogicalThickness = 25
     InternalOriginActive = True
@@ -110,7 +111,7 @@ object RotatedEditDemoForm: TRotatedEditDemoForm
   end
   object VerticalDownEdit: TRotatedEdit
     Left = 56
-    Top = 550
+    Top = 557
     Width = 26
     Height = 150
     Cursor = crIBeam
@@ -127,7 +128,7 @@ object RotatedEditDemoForm: TRotatedEditDemoForm
   end
   object VerticalUpEdit: TRotatedEdit
     Left = 187
-    Top = 550
+    Top = 557
     Width = 26
     Height = 150
     Cursor = crIBeam
@@ -143,27 +144,27 @@ object RotatedEditDemoForm: TRotatedEditDemoForm
     InternalOriginY = 150.000000000000000000
   end
   object FreeAngleEdit: TRotatedEdit
-    Left = 27
-    Top = 381
-    Width = 119
-    Height = 119
+    Left = 18
+    Top = 422
+    Width = 145
+    Height = 50
     Cursor = crIBeam
     Hint = 'Zone de saisie'
     ParentColor = False
     ParentShowHint = False
     ShowHint = True
     TabOrder = 5
-    Text = 'Angle 315 degrees'
+    Text = 'Angle 10 degrees'
     Orientation = reoCustomAngle
-    Angle = 315.000000000000000000
+    Angle = 10.000000000000000000
     LogicalLength = 142
     LogicalThickness = 25
     MaxLength = 20
     Alignment = taCenter
     TextHint = 'Test de Hint'
     InternalOriginActive = True
-    InternalOriginX = 17.677669529663690000
-    InternalOriginY = 0.000000000000000000
+    InternalOriginX = 0.000000000000000000
+    InternalOriginY = 24.658041228704110000
   end
   object TrackBarRotation: TTrackBar
     Left = 19
@@ -172,7 +173,7 @@ object RotatedEditDemoForm: TRotatedEditDemoForm
     Height = 45
     Max = 360
     Frequency = 10
-    Position = 315
+    Position = 10
     TabOrder = 6
     OnChange = TrackBarRotationChange
   end
@@ -204,7 +205,7 @@ object RotatedEditDemoForm: TRotatedEditDemoForm
       Caption = 'Event counters'
     end
     object EventGrid: TStringGrid
-      Left = 160
+      Left = 156
       Top = 66
       Width = 646
       Height = 559
@@ -230,17 +231,17 @@ object RotatedEditDemoForm: TRotatedEditDemoForm
       OnClick = ResetEventsButtonClick
     end
     object RotatedEdit1: TRotatedEdit
-      Left = 10
+      Left = 18
       Top = 66
-      Width = 138
-      Height = 138
+      Width = 127
+      Height = 126
       Cursor = crIBeam
       ParentColor = False
       TabOrder = 2
       Text = 'Angle 45 degrees'
       Orientation = reoCustomAngle
       Angle = 45.000000000000000000
-      LogicalLength = 170
+      LogicalLength = 153
       LogicalThickness = 25
       OnChange = CustomAngleEditChange
       OnSelectionChange = CustomAngleEditSelectionChange
@@ -265,8 +266,8 @@ object RotatedEditDemoForm: TRotatedEditDemoForm
       OnMouseWheelDown = CustomAngleEditMouseWheelDown
       OnMouseWheelUp = CustomAngleEditMouseWheelUp
       InternalOriginActive = True
-      InternalOriginX = 0.000000000000000000
-      InternalOriginY = 120.208152801713100000
+      InternalOriginX = 1.134992948794533000
+      InternalOriginY = 108.322330470336300000
     end
   end
 end

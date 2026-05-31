@@ -188,7 +188,7 @@ Type
         //
         //This is not an optimization. It is required for correctness.
         //
-        //Example that caused a regression after v53:
+        //Example that previously caused a regression:
         //- edit angle = 45 degrees;
         //- the user drags the physical top-right designer handle;
         //- the first SetBounds call correctly looks like rerzTopRight;
@@ -298,6 +298,37 @@ Type
         FClickCount:          Integer;
 
         FCaretController: TRotatedEditCaretController;
+
+        //-----------------------------------------------------------------
+        //Caret blink invalidation cache.
+        //
+        //The caret is not part of FContentBitmap: it blinks independently over
+        //the cached non-caret content. Older versions invalidated the whole
+        //control on every blink. On freely rotated controls this forced the
+        //transparent parent background to be restored at the caret timer rate,
+        //which could look like a periodic flicker in the demo when the edit had
+        //focus.
+        //
+        //These fields remember the last small screen-space rectangle occupied
+        //by the caret so the next blink can invalidate only the union of the old
+        //and current caret area. Full invalidations are still used for text,
+        //layout, color, style and backend changes.
+        //-----------------------------------------------------------------
+        FLastCaretInvalidateRect: TRect;
+        FLastCaretInvalidateRectValid: Boolean;
+
+        //-----------------------------------------------------------------
+        //Rendering backend selection.
+        //
+        //FRenderBackendKind stores the requested backend exposed by the
+        //component. FRenderBackend stores the effective backend instance
+        //created by the backend factory. rebDirect2D is the default renderer
+        //and draws through the native Direct2D/DirectWrite backend when those
+        //resources are available. rebGDI remains available as the historical
+        //compatibility renderer and as the fallback path used by the Direct2D
+        //backend when native rendering cannot be initialized or completed.
+        //-----------------------------------------------------------------
+        FRenderBackendKind: TRotatedEditRenderBackendKind;
         FRenderBackend: IRotatedEditRenderBackend;
 
         //-----------------------------------------------------------------
@@ -409,6 +440,9 @@ Type
         Procedure SetBorderStyle(Const Value: TBorderStyle);
         Procedure SetBorderColor(Const Value: TColor);
         Procedure SetPaletteMode(Const Value: TRotatedEditPaletteMode);
+        Procedure SetRenderBackendKind(Const Value: TRotatedEditRenderBackendKind);
+        Procedure RecreateRenderBackend;
+        Procedure TraceRenderBackendState(Const AReason: String);
 
         Procedure SetTextPaddingStart(Const Value: Integer);
         Procedure SetTextPaddingEnd(Const Value: Integer);
@@ -480,8 +514,11 @@ Type
         Function CreateRegionFromCurrentLayout: HRGN;
 
         Procedure CaretChanged(Sender: TObject);
-        Procedure PaintTransparentBackground;
+        Function BuildCaretInvalidationRect(Out ARect: TRect): Boolean;
+        Procedure InvalidateCaretArea;
+        Procedure PaintTransparentBackground(ACanvas: TCanvas);
         Procedure DrawDesignSelectionMarkers(
+            ACanvas: TCanvas;
             Const ALayout: TRotatedEditLayoutResult);
 
         Procedure DestroyHoverCursor;
@@ -768,7 +805,7 @@ Type
           Selects the palette source.
 
           repmStyle uses the resolved VCL style palette and honors
-          StyleElements. Runtime keeps the existing v76 resolution behavior
+          StyleElements. Runtime keeps the established style-service order
           because it already returns the expected application colors.
           Design-time prefers the parent/control style context so the
           owner-drawn surface matches the form designer style more closely.
@@ -776,6 +813,24 @@ Type
           repmCustom uses Color / Font.Color / BorderColor.
         }
         Property PaletteMode: TRotatedEditPaletteMode Read FPaletteMode Write SetPaletteMode Default repmStyle;
+
+        {
+          Requested rendering backend.
+
+          rebDirect2D is the default backend. It uses Direct2D for final-shape
+          geometry and DirectWrite for text, selection and caret metrics. The
+          backend draws in the final oriented coordinate system and falls back
+          internally to the GDI backend if native Direct2D resources are not
+          available or if a Direct2D paint pass fails.
+
+          rebGDI keeps the historical GDI renderer available for compatibility
+          and explicit testing. It is also the safety fallback used by the
+          Direct2D backend.
+        }
+        Property RenderBackend: TRotatedEditRenderBackendKind
+            Read FRenderBackendKind
+            Write SetRenderBackendKind
+            Default rebDirect2D;
 
         {
           Logical margin at the start of the text flow.
@@ -922,6 +977,7 @@ Begin
     FBorderStyle := bsSingle;
     FBorderColor := clBtnShadow;
     FPaletteMode := repmStyle;
+    FRenderBackendKind := rebDirect2D;
 
     FPaddingLeft := 3;
     FPaddingRight := 3;
@@ -931,6 +987,9 @@ Begin
     FCaretController := TRotatedEditCaretController.Create(Self);
     FCaretController.OnCaretChanged := CaretChanged;
 
+    FLastCaretInvalidateRect := Rect(0, 0, 0, 0);
+    FLastCaretInvalidateRectValid := False;
+
     //---------------------------------------------------------------------
     //Rendering backend.
     //
@@ -939,7 +998,7 @@ Begin
     //future Direct2D/DirectWrite backend can own both drawing and text metrics
     //without mixing GDI measurements with DirectWrite rendering.
     //---------------------------------------------------------------------
-    FRenderBackend := TRotatedEditGDIRenderBackend.Create;
+    RecreateRenderBackend;
 
     FBackgroundBitmap := TBitmap.Create;
     FBackgroundBitmap.PixelFormat := pf32bit;
@@ -2036,8 +2095,8 @@ Begin
     //    user-requested source of truth.
     //
     //Do not simplify this into a direct Width/Height-to-LogicalLength/
-    //LogicalThickness mapping. That would reintroduce the v53 regression fixed
-    //again in v82: a rotated design-time corner drag could change both logical
+    //LogicalThickness mapping. That would reintroduce the design-time resize regression: a rotated
+    //corner drag could change both logical
     //dimensions.
     //-------------------------------------------------------------------------
     //---------------------------------------------------------------------
@@ -2767,6 +2826,92 @@ Begin
         ApplyAutoSizeLogicalThickness;
 
     Invalidate;
+End;
+
+Procedure TRotatedEditCore.SetRenderBackendKind(
+    Const Value: TRotatedEditRenderBackendKind);
+Begin
+    If FRenderBackendKind = Value Then
+        Exit;
+
+    FRenderBackendKind := Value;
+
+    //---------------------------------------------------------------------
+    //Backend changes invalidate every cached bitmap and every text-metric
+    //dependent value. Changing the requested backend may switch between
+    //different native rendering engines, so this invalidation rule is deliberately written as
+    //the future-safe rule for the real Direct2D/DirectWrite backend.
+    //---------------------------------------------------------------------
+    RecreateRenderBackend;
+    InvalidateBackgroundCache;
+    InvalidateContentBitmap;
+    InvalidatePreferredLogicalThickness;
+    InvalidateHoverCursor;
+    UpdateWindowRegion;
+    Invalidate;
+End;
+
+Procedure TRotatedEditCore.RecreateRenderBackend;
+Begin
+    FRenderBackend := CreateRotatedEditRenderBackend(FRenderBackendKind);
+
+    //---------------------------------------------------------------------
+    // Keep backend state traces out of the published API. OutputDebugString is
+    // intentionally used as a lightweight development/debug stream: it can be
+    // observed from the IDE or from tools such as DebugView, but it does not
+    // change the component contract and it does not introduce another
+    // design-time property.
+    //---------------------------------------------------------------------
+    TraceRenderBackendState('backend recreated');
+End;
+
+Procedure TRotatedEditCore.TraceRenderBackendState(Const AReason: String);
+Var
+    LBackendName: String;
+    LControlName: String;
+    LRequestedBackendName: String;
+Begin
+    //-------------------------------------------------------------------------
+    // Emits a lightweight backend diagnostic in the Windows debug stream.
+    //
+    // The method is deliberately private and side-effect free. It makes the
+    // requested backend and the effective backend state visible during
+    // development without committing to a public diagnostic API. The backend
+    // itself remains the source of truth for the readable active state through
+    // IRotatedEditRenderBackend.GetBackendName.
+    //
+    // The trace also prints the requested published backend value. This matters
+    // because rebDirect2D can legitimately fall back to GDI when Direct2D /
+    // DirectWrite initialization or a Direct2D paint pass fails.
+    //-------------------------------------------------------------------------
+    If FRenderBackend = Nil Then
+        LBackendName := '<none>'
+    Else
+        LBackendName := FRenderBackend.GetBackendName;
+
+    Case FRenderBackendKind Of
+        rebGDI:
+            LRequestedBackendName := 'rebGDI';
+
+        rebDirect2D:
+            LRequestedBackendName := 'rebDirect2D';
+    Else
+        LRequestedBackendName := '<unknown>';
+    End;
+
+    LControlName := Name;
+
+    If LControlName = '' Then
+        LControlName := ClassName;
+
+    OutputDebugString(PChar(Format(
+        'VclRotatedEdit: %s: %s: requested=%s; active=%s',
+        [
+            LControlName,
+            AReason,
+            LRequestedBackendName,
+            LBackendName
+        ])));
 End;
 
 Procedure TRotatedEditCore.SetTextPaddingStart(Const Value: Integer);
@@ -3542,7 +3687,7 @@ Begin
     //
     //Important regression note:
     //Do not return HTTRANSPARENT from WM_NCHITTEST in design-time to filter the
-    //rectangular BoundsRect. That was tested after v53 and broke the designer
+    //rectangular BoundsRect. That was tested previously and broke the designer
     //resize workflow because some resize handles live outside the projected
     //rotated edit surface.
     //-------------------------------------------------------------------------
@@ -4296,9 +4441,114 @@ Begin
         DeleteObject(LRegion);
 End;
 
+Function TRotatedEditCore.BuildCaretInvalidationRect(Out ARect: TRect): Boolean;
+Var
+    LLayout: TRotatedEditLayoutResult;
+    LMinX: Double;
+    LMaxX: Double;
+    LMinY: Double;
+    LMaxY: Double;
+    LInflate: Integer;
+Begin
+    //-------------------------------------------------------------------------
+    //Builds the smallest practical physical rectangle covering the projected
+    //caret. This method is used only for caret blinking. It must not invalidate
+    //text, selection or background caches: those caches are handled by the
+    //normal editing/layout setters.
+    //
+    //The caret quad is already part of the common layout result. Using it here
+    //keeps the invalidation rectangle consistent for horizontal, vertical and
+    //free-angle orientations, including 45-degree controls.
+    //-------------------------------------------------------------------------
+    Result := False;
+    ARect := Rect(0, 0, 0, 0);
+
+    If Not HandleAllocated Then
+        Exit;
+
+    Canvas.Font.Assign(Font);
+
+    LLayout := BuildCurrentLayout;
+
+    LMinX := Min(
+        Min(LLayout.Caret.ActualQuad.P1.X, LLayout.Caret.ActualQuad.P2.X),
+        Min(LLayout.Caret.ActualQuad.P3.X, LLayout.Caret.ActualQuad.P4.X));
+    LMaxX := Max(
+        Max(LLayout.Caret.ActualQuad.P1.X, LLayout.Caret.ActualQuad.P2.X),
+        Max(LLayout.Caret.ActualQuad.P3.X, LLayout.Caret.ActualQuad.P4.X));
+    LMinY := Min(
+        Min(LLayout.Caret.ActualQuad.P1.Y, LLayout.Caret.ActualQuad.P2.Y),
+        Min(LLayout.Caret.ActualQuad.P3.Y, LLayout.Caret.ActualQuad.P4.Y));
+    LMaxY := Max(
+        Max(LLayout.Caret.ActualQuad.P1.Y, LLayout.Caret.ActualQuad.P2.Y),
+        Max(LLayout.Caret.ActualQuad.P3.Y, LLayout.Caret.ActualQuad.P4.Y));
+
+    ARect := Rect(
+        Floor(LMinX),
+        Floor(LMinY),
+        Ceil(LMaxX),
+        Ceil(LMaxY));
+
+    //-------------------------------------------------------------------------
+    //Give GDI a small safety margin. The caret may be antialiased or drawn with
+    //a pen width greater than one pixel, and free-angle transforms can touch
+    //neighboring pixels. The margin stays deliberately small so blinking does
+    //not repaint the entire rotated edit surface anymore.
+    //-------------------------------------------------------------------------
+    LInflate := Max(3, FCaretThickness + 2);
+    InflateRect(
+        ARect,
+        LInflate,
+        LInflate);
+
+    IntersectRect(
+        ARect,
+        ARect,
+        ClientRect);
+
+    Result := Not IsRectEmpty(ARect);
+End;
+
+Procedure TRotatedEditCore.InvalidateCaretArea;
+Var
+    LCaretRect: TRect;
+    LDirtyRect: TRect;
+Begin
+    //-------------------------------------------------------------------------
+    //Caret blinking is driven by a timer. Invalidating the whole custom control
+    //on every tick is visually expensive because PaintTransparentBackground may
+    //ask the parent to repaint through the control DC. Restricting the update
+    //region to the caret's old/current location removes the visible heartbeat
+    //while preserving the normal blinking behavior.
+    //-------------------------------------------------------------------------
+    If Not BuildCaretInvalidationRect(LCaretRect) Then Begin
+        Invalidate;
+        Exit;
+    End;
+
+    LDirtyRect := LCaretRect;
+
+    If FLastCaretInvalidateRectValid Then
+        UnionRect(
+            LDirtyRect,
+            LDirtyRect,
+            FLastCaretInvalidateRect);
+
+    FLastCaretInvalidateRect := LCaretRect;
+    FLastCaretInvalidateRectValid := True;
+
+    If HandleAllocated Then
+        InvalidateRect(
+            Handle,
+            @LDirtyRect,
+            False)
+    Else
+        Invalidate;
+End;
+
 Procedure TRotatedEditCore.CaretChanged(Sender: TObject);
 Begin
-    Invalidate;
+    InvalidateCaretArea;
 End;
 
 Procedure TRotatedEditCore.Loaded;
@@ -4344,7 +4594,7 @@ Begin
         UpdateWindowRegion;
 End;
 
-Procedure TRotatedEditCore.PaintTransparentBackground;
+Procedure TRotatedEditCore.PaintTransparentBackground(ACanvas: TCanvas);
 Var
     LSaveIndex: Integer;
     LPoint:     TPoint;
@@ -4365,26 +4615,46 @@ Begin
     //- il faut le faire à chaque Paint, notamment à cause du blink du caret.
     //-------------------------------------------------------------------------
     If Parent = Nil Then Begin
-        Canvas.Brush.Style := bsSolid;
-        Canvas.Brush.Color := Color;
-        Canvas.FillRect(ClientRect);
+        ACanvas.Brush.Style := bsSolid;
+        ACanvas.Brush.Color := Color;
+        ACanvas.FillRect(ClientRect);
         Exit;
     End;
 
-    LSaveIndex := SaveDC(Canvas.Handle);
+    //-------------------------------------------------------------------------
+    //Fallback fill before asking the parent to erase/paint itself.
+    //
+    //The off-screen Paint path composes the transparent background into a
+    //memory bitmap first. During design-time drag operations the designer may
+    //call the control paint while the parent does not fully repaint that memory
+    //DC. If the temporary bitmap is left with its default pixels, the rectangular
+    //host area around the rotated edit can briefly appear white.
+    //
+    //We therefore seed the buffer with the parent's current brush color before
+    //the regular transparency emulation. Runtime parent painting still has the
+    //last word when it succeeds, but the design-time fallback is no longer the
+    //uninitialized/white bitmap content.
+    //-------------------------------------------------------------------------
+    If Not (csDesigning In ComponentState) Then Begin
+        ACanvas.Brush.Style := bsSolid;
+        ACanvas.Brush.Color := Parent.Brush.Color;
+        ACanvas.FillRect(ClientRect);
+    End;
+
+    LSaveIndex := SaveDC(ACanvas.Handle);
     Try
         LPoint := Point(
             Left,
             Top);
 
         MoveWindowOrg(
-            Canvas.Handle,
+            ACanvas.Handle,
             LPoint.X,
             LPoint.Y);
 
         Parent.Perform(
             WM_ERASEBKGND,
-            Canvas.Handle,
+            ACanvas.Handle,
             0);
 
         //---------------------------------------------------------------------
@@ -4403,15 +4673,16 @@ Begin
         If Not (csDesigning In ComponentState) Then
             Parent.Perform(
                 WM_PAINT,
-                Canvas.Handle,
+                ACanvas.Handle,
                 0);
     Finally RestoreDC(
-            Canvas.Handle,
+            ACanvas.Handle,
             LSaveIndex);
     End;
 End;
 
 Procedure TRotatedEditCore.DrawDesignSelectionMarkers(
+    ACanvas: TCanvas;
     Const ALayout: TRotatedEditLayoutResult);
 Var
     LOldPenColor: TColor;
@@ -4492,7 +4763,7 @@ Var
             Round(LCx - (ADirUX * LHalfHandle) + (ADirVX * LHalfHandle)),
             Round(LCy - (ADirUY * LHalfHandle) + (ADirVY * LHalfHandle)));
 
-        Canvas.Polygon(LPoints);
+        ACanvas.Polygon(LPoints);
     End;
 
 Begin
@@ -4526,11 +4797,11 @@ Begin
     If Not FDesignSelectionSelected Then
         Exit;
 
-    LOldPenColor := Canvas.Pen.Color;
-    LOldPenStyle := Canvas.Pen.Style;
-    LOldPenMode := Canvas.Pen.Mode;
-    LOldBrushColor := Canvas.Brush.Color;
-    LOldBrushStyle := Canvas.Brush.Style;
+    LOldPenColor := ACanvas.Pen.Color;
+    LOldPenStyle := ACanvas.Pen.Style;
+    LOldPenMode := ACanvas.Pen.Mode;
+    LOldBrushColor := ACanvas.Brush.Color;
+    LOldBrushStyle := ACanvas.Brush.Style;
 
     Try
         //---------------------------------------------------------------------
@@ -4569,11 +4840,11 @@ Begin
         LHandleSize := 6.0;
         LHalfHandle := LHandleSize / 2.0;
 
-        Canvas.Pen.Mode := pmXor;
-        Canvas.Pen.Color := clWhite;
-        Canvas.Pen.Style := psSolid;
-        Canvas.Brush.Style := bsSolid;
-        Canvas.Brush.Color := clWhite;
+        ACanvas.Pen.Mode := pmXor;
+        ACanvas.Pen.Color := clWhite;
+        ACanvas.Pen.Style := psSolid;
+        ACanvas.Brush.Style := bsSolid;
+        ACanvas.Brush.Color := clWhite;
 
         //---------------------------------------------------------------------
         //Each corner receives the two inward directions that keep the marker
@@ -4611,11 +4882,11 @@ Begin
             -LVx,
             -LVy);
     Finally
-        Canvas.Pen.Color := LOldPenColor;
-        Canvas.Pen.Style := LOldPenStyle;
-        Canvas.Pen.Mode := LOldPenMode;
-        Canvas.Brush.Color := LOldBrushColor;
-        Canvas.Brush.Style := LOldBrushStyle;
+        ACanvas.Pen.Color := LOldPenColor;
+        ACanvas.Pen.Style := LOldPenStyle;
+        ACanvas.Pen.Mode := LOldPenMode;
+        ACanvas.Brush.Color := LOldBrushColor;
+        ACanvas.Brush.Style := LOldBrushStyle;
     End;
 End;
 
@@ -4623,74 +4894,131 @@ Procedure TRotatedEditCore.Paint;
 Var
     LLayout: TRotatedEditLayoutResult;
     LColors: TRotatedEditStyleColors;
+    LPaintBuffer: TBitmap;
+    LPaintCanvas: TCanvas;
+
+    Procedure DrawRotatedEditVisuals(ACanvas: TCanvas);
+    Begin
+        //---------------------------------------------------------------------
+        //Draws the complete rotated edit visual state on the supplied canvas.
+        //
+        //This local helper deliberately contains the common part of both paint
+        //paths:
+        //- runtime path: draw into an off-screen bitmap, then BitBlt once;
+        //- design-time path: draw directly on the control DC.
+        //
+        //Keeping the drawing sequence in one place avoids future divergences
+        //between runtime and design-time rendering while allowing design-time
+        //drag operations to bypass the runtime off-screen transparency emulation
+        //that introduced a white rectangular host background in the IDE.
+        //---------------------------------------------------------------------
+        PaintTransparentBackground(ACanvas);
+
+        ACanvas.Font.Assign(Font);
+        Canvas.Font.Assign(Font);
+
+        LLayout := BuildCurrentLayout;
+
+        LColors := TRotatedEditStyle.ResolveColors(
+            Self,
+            Enabled,
+            Focused,
+            Color,
+            Font.Color,
+            FBorderColor,
+            FPaletteMode = repmStyle,
+            {$IFDEF VCLROTATEDEDIT_HAS_CONTROL_STYLE_NAME}
+            StyleName,
+            {$ELSE}
+            '',
+            {$ENDIF}
+            StyleElements,
+            FBorderStyle);
+
+        //---------------------------------------------------------------------
+        //Non-caret content.
+        //
+        //This call composes background, selection and text into a canonical opaque
+        //surface, then projects it. There is no transparent color key, so the old
+        //clFuchsia artifact cannot appear.
+        //---------------------------------------------------------------------
+        FRenderBackend.DrawContent(
+            ACanvas,
+            LLayout,
+            LColors,
+            FBackgroundBitmap,
+            FBackgroundBitmapValid,
+            FContentBitmap,
+            FContentBitmapValid,
+            FShowDebugBounds,
+            FTextHint);
+
+        //---------------------------------------------------------------------
+        //Caret d'insertion.
+        //
+        //The caret stays outside the content bitmap. Its blink only invalidates the
+        //control paint, not the cached background/content surfaces.
+        //---------------------------------------------------------------------
+        FRenderBackend.DrawCaret(
+            ACanvas,
+            LLayout,
+            LColors,
+            Focused And FCaretController.CaretVisible);
+
+        DrawDesignSelectionMarkers(
+            ACanvas,
+            LLayout);
+    End;
+
 Begin
     //-------------------------------------------------------------------------
     //The control is not opaque.
     //
-    //Before drawing the projected editable surface, the parent background is
-    //restored. This prevents the physical VCL bounding box from being filled as
-    //a rectangle around an angled edit surface.
+    //Runtime painting keeps the off-screen composition because it removes
+    //the visible intermediate frame where the parent background is restored
+    //before the rotated edit content is drawn.
     //
-    //The visible non-caret content is then composed into a canonical opaque
-    //bitmap and projected in one pass. The caret remains separate so blinking
-    //does not rebuild the content bitmap.
+    //Design-time painting intentionally keeps the older direct-to-window path.
+    //The IDE can repaint a component while it is being dragged/resized in ways
+    //that do not behave like a normal runtime WM_PAINT. In that situation the
+    //temporary bitmap could expose a white rectangular host area around the
+    //rotated edit. Drawing directly in design-time restores the previous designer
+    //behaviour while preserving the runtime flicker fix.
     //-------------------------------------------------------------------------
 
-    PaintTransparentBackground;
+    If (ClientWidth <= 0) Or (ClientHeight <= 0) Then
+        Exit;
 
-    Canvas.Font.Assign(Font);
+    If csDesigning In ComponentState Then Begin
+        DrawRotatedEditVisuals(Canvas);
+        Exit;
+    End;
 
-    LLayout := BuildCurrentLayout;
+    LPaintBuffer := TBitmap.Create;
+    Try
+        LPaintBuffer.PixelFormat := pf32bit;
+        LPaintBuffer.SetSize(
+            ClientWidth,
+            ClientHeight);
 
-    LColors := TRotatedEditStyle.ResolveColors(
-        Self,
-        Enabled,
-        Focused,
-        Color,
-        Font.Color,
-        FBorderColor,
-        FPaletteMode = repmStyle,
-        {$IFDEF VCLROTATEDEDIT_HAS_CONTROL_STYLE_NAME}
-        StyleName,
-        {$ELSE}
-        '',
-        {$ENDIF}
-        StyleElements,
-        FBorderStyle);
+        LPaintCanvas := LPaintBuffer.Canvas;
 
-    //---------------------------------------------------------------------
-    //Non-caret content.
-    //
-    //This call composes background, selection and text into a canonical opaque
-    //surface, then projects it. There is no transparent color key, so the old
-    //clFuchsia artifact cannot appear.
-    //---------------------------------------------------------------------
-    FRenderBackend.DrawContent(
-        Canvas,
-        LLayout,
-        LColors,
-        FBackgroundBitmap,
-        FBackgroundBitmapValid,
-        FContentBitmap,
-        FContentBitmapValid,
-        FShowDebugBounds,
-        FTextHint);
+        DrawRotatedEditVisuals(LPaintCanvas);
 
-    //---------------------------------------------------------------------
-    //Caret d'insertion.
-    //
-    //The caret stays outside the content bitmap. Its blink only invalidates the
-    //control paint, not the cached background/content surfaces.
-    //---------------------------------------------------------------------
-    FRenderBackend.DrawCaret(
-        Canvas,
-        LLayout,
-        LColors,
-        Focused And FCaretController.CaretVisible);
-    DrawDesignSelectionMarkers(
-        LLayout);
+        BitBlt(
+            Canvas.Handle,
+            0,
+            0,
+            ClientWidth,
+            ClientHeight,
+            LPaintCanvas.Handle,
+            0,
+            0,
+            SRCCOPY);
+    Finally
+        LPaintBuffer.Free;
+    End;
 End;
-
 
 
 Function TRotatedEditCore.BuildCurrentLayout: TRotatedEditLayoutResult;
@@ -4757,6 +5085,12 @@ Begin
     LInput.CaretIndex := FCaretIndex;
     LInput.SelStart := FSelStart;
     LInput.SelLength := FSelLength;
+    //---------------------------------------------------------------------
+    // Keep the logical selection when focus is lost, but hide its visual
+    // highlight for this paint/layout pass. This mirrors the default TEdit
+    // behaviour and applies equally to the GDI and Direct2D backends.
+    //---------------------------------------------------------------------
+    LInput.SelectionVisible := Focused;
     LInput.CaretThickness := FCaretThickness;
     LInput.Alignment := FAlignment;
     LInput.UseCustomActualOrigin := FUseInternalOrigin;
@@ -5270,7 +5604,7 @@ Begin
     //
     //This reset intentionally happens BEFORE the design-time exit below.
     //
-    //v53 cleared the designer resize lock when a normal mouse interaction
+    //A previous cleanup cleared the designer resize lock when a normal mouse interaction
     //started. Later versions added an early design-time exit so the IDE designer
     //could keep ownership of selection and drag gestures, but that also skipped
     //this cleanup. A stale FDesignerResizeGrip can make a later designer resize
@@ -5428,7 +5762,7 @@ Begin
     //This reset intentionally happens BEFORE the design-time exit below.
     //
     //The Delphi designer does not give this control a clean resize-begin /
-    //resize-end notification. v53 therefore relied on ordinary mouse messages
+    //resize-end notification. The component therefore relies on ordinary mouse messages
     //to clear the inferred resize grip between gestures.
     //
     //When the design-time early exit was introduced, this cleanup was skipped.
@@ -5783,7 +6117,7 @@ Initialization
     //TRotatedEditStyle and the active render backend.
     //
     //The hook is kept as a compatibility/integration aid so the VCL style
-    //engine can treat the control as style-aware. v77 deliberately uses the
+    //engine can treat the control as style-aware. The registration deliberately uses the
     //neutral TStyleHook rather than TEditStyleHook because this control is not a
     //native TEdit and does not let the edit style hook perform the painting.
     //-------------------------------------------------------------------------
