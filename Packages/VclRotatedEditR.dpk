@@ -26,6 +26,7 @@ Package VclRotatedEditR;
 {$DEFINE DEBUG}
 {$ENDIF IMPLICITBUILDING}
 {$DESCRIPTION 'TRotatedEdit runtime package'}
+{$RUNONLY}
 {$IMPLICITBUILD ON}
 
 {
