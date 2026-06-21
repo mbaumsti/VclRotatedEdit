@@ -272,6 +272,41 @@ Type
         Function Direct2DStateText: String;
         Function ShouldUseDirect2DContentPath: Boolean;
 
+        //---------------------------------------------------------------------
+        //Helpers partagés entre le rendu, le caret, la sélection et le hit-test.
+        //
+        //Ces deux méthodes factorisent la création du IDWriteTextFormat et du
+        //IDWriteTextLayout DirectWrite, qui était précédemment dupliquée dans
+        //chaque procédure locale de DrawContentWithDirect2DPath et DrawCaret.
+        //Centraliser ici garantit que toutes les mesures (sélection, caret,
+        //hit-test souris) utilisent exactement le même format que le texte affiché.
+        //---------------------------------------------------------------------
+        Function CreateD2DTextFormat(
+            ACanvas: TCanvas;
+            Out ATextFormat: IDWriteTextFormat): Boolean;
+
+        Function CreateD2DTextLayout(
+            Const AText: String;
+            ATextFormat: IDWriteTextFormat;
+            AMaxHeight: Single;
+            Out ATextLayout: IDWriteTextLayout): Boolean;
+
+        //---------------------------------------------------------------------
+        //Recalcul du scroll offset via métriques DirectWrite.
+        //
+        //EnsureCaretVisible dans Layout.pas utilise les métriques GDI. Quand le
+        //backend Direct2D est actif, le texte est rendu par DirectWrite dont les
+        //avances peuvent différer légèrement de GDI (sous-pixels, hinting).
+        //Cette méthode recalcule le scroll en demandant à DirectWrite la position
+        //exacte du caret, garantissant que le scroll est cohérent avec le rendu.
+        //---------------------------------------------------------------------
+        Function EnsureCaretVisibleD2D(
+            ACanvas: TCanvas;
+            Const AText: String;
+            ACaretIndex: Integer;
+            ACurrentScrollOffset: Integer;
+            Const ACanonicalContentRect: TRect): Integer;
+
         Function DrawContentWithDirect2DPath(
             ACanvas: TCanvas;
             Const ALayout: TRotatedEditLayoutResult;
@@ -980,46 +1015,13 @@ Var
     End;
 
     Function CreateTextFormat(Var ATextFormat: IDWriteTextFormat): Boolean;
-    Var
-        LFontName: WideString;
-        LLocaleName: WideString;
-        LResultLocal: HResult;
     Begin
         //---------------------------------------------------------------------
-        // first DirectWrite text format.
-        //
-        //Do not expose this format outside the Direct2D path yet. Text measurement,
-        //hit-test, selection and caret positions still come from the current
-        //layout path, so this format is only a visual first step.
+        //Délègue à la méthode de classe CreateD2DTextFormat.
+        //La méthode de classe est la source unique de création du format :
+        //rendu, caret, sélection et hit-test utilisent tous le même format.
         //---------------------------------------------------------------------
-        Result := False;
-        ATextFormat := Nil;
-
-        If Not Assigned(FDWriteFactory) Then
-            Exit;
-
-        LFontName := ACanvas.Font.Name;
-        LLocaleName := 'fr-FR';
-
-        LResultLocal := FDWriteFactory.CreateTextFormat(
-            PWideChar(LFontName),
-            Nil,
-            ResolveDWriteFontWeight,
-            ResolveDWriteFontStyle,
-            DWRITE_FONT_STRETCH_NORMAL,
-            ResolveDWriteFontSize,
-            PWideChar(LLocaleName),
-            ATextFormat);
-
-        If LResultLocal < 0 Then
-        Begin
-            FD2DState.RenderState := rddsRenderFailed;
-            FD2DState.LastNativeError := LResultLocal;
-            ATextFormat := Nil;
-            Exit;
-        End;
-
-        Result := Assigned(ATextFormat);
+        Result := CreateD2DTextFormat(ACanvas, ATextFormat);
     End;
 
     Function CreateTextLayout(
@@ -1027,65 +1029,15 @@ Var
         ATextFormat: IDWriteTextFormat;
         Var ATextLayout: IDWriteTextLayout): Boolean;
     Var
-        LWideText: WideString;
-        LResultLocal: HResult;
-        LMaxWidth: Single;
         LMaxHeight: Single;
     Begin
         //---------------------------------------------------------------------
-        // first DirectWrite metric object.
-        //
-        //The goal of this pass is intentionally limited: before implementing
-        //the more expensive prefix-by-prefix measuring strategy used by the
-        //GDI correction , ask DirectWrite for native caret/text positions
-        //through IDWriteTextLayout. If these positions are coherent with the
-        //DrawText output, the Direct2D backend can avoid duplicating the GDI
-        //workaround and keep text drawing/metrics under one native engine.
+        //Délègue à la méthode de classe CreateD2DTextLayout.
+        //La hauteur canonique du contenu est passée comme contrainte de layout ;
+        //CreateD2DTextLayout applique un plancher si elle est nulle ou négative.
         //---------------------------------------------------------------------
-        Result := False;
-        ATextLayout := Nil;
-
-        If Not Assigned(FDWriteFactory) Then
-            Exit;
-
-        If Not Assigned(ATextFormat) Then
-            Exit;
-
-        LWideText := ADisplayText;
-
-        // Keep this Direct2D path single-line. The component is a TEdit-like
-        // control, so wrapping would make DirectWrite metrics disagree with
-        // the current layout model. Ignore the HRESULT here: older headers may
-        // still compile the method but failure should simply leave the default
-        // format in place for this experimental pass.
-        ATextFormat.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
-
-        LMaxWidth := 100000.0;
         LMaxHeight := Single(ALayout.CanonicalContentRect.Height);
-
-        If LMaxHeight < 1.0 Then
-            LMaxHeight := Single(ALayout.LogicalThickness);
-
-        If LMaxHeight < 1.0 Then
-            LMaxHeight := 1000.0;
-
-        LResultLocal := FDWriteFactory.CreateTextLayout(
-            PWideChar(LWideText),
-            Length(LWideText),
-            ATextFormat,
-            LMaxWidth,
-            LMaxHeight,
-            ATextLayout);
-
-        If LResultLocal < 0 Then
-        Begin
-            FD2DState.RenderState := rddsRenderFailed;
-            FD2DState.LastNativeError := LResultLocal;
-            ATextLayout := Nil;
-            Exit;
-        End;
-
-        Result := Assigned(ATextLayout);
+        Result := CreateD2DTextLayout(ADisplayText, ATextFormat, LMaxHeight, ATextLayout);
     End;
 
     Procedure DrawDirect2DSelection;
@@ -1621,29 +1573,462 @@ Begin
         ATextHint);
 End;
 
+Function TRotatedEditDirect2DRenderBackend.CreateD2DTextFormat(
+    ACanvas: TCanvas;
+    Out ATextFormat: IDWriteTextFormat): Boolean;
+Var
+    LFontName:    WideString;
+    LLocaleName:  WideString;
+    LFontSize:    Single;
+    LFontWeight:  DWRITE_FONT_WEIGHT;
+    LFontStyle:   DWRITE_FONT_STYLE;
+    LResult:      HResult;
+Begin
+    //-------------------------------------------------------------------------
+    //Crée un IDWriteTextFormat à partir des propriétés de ACanvas.Font.
+    //
+    //Règle d'unicité
+    //---------------
+    //Cette méthode est la seule source de création d'un IDWriteTextFormat dans
+    //ce backend. Toute autre création locale (dans DrawCaret, DrawDirect2DSelection,
+    //HitTest) doit passer par ici pour garantir que le texte affiché et les
+    //métriques de caret/sélection/hit-test utilisent strictement le même format.
+    //
+    //Conversion taille
+    //-----------------
+    //DirectWrite attend des DIPs (Device-Independent Pixels à 96 DPI).
+    //TFont.Size > 0 est en points typographiques (72 pts = 1 pouce).
+    //Conversion : Size_pts * 96 / 72 = Size_DIPs.
+    //Si Font.Height est utilisé (valeur négative = pixels logiques GDI),
+    //on prend la valeur absolue comme approximation raisonnable en pixels.
+    //
+    //Locale
+    //------
+    //'fr-FR' était codé en dur dans les variantes locales précédentes.
+    //On conserve ce choix pour la cohérence avec l'existant. Une future
+    //version pourra passer la locale en paramètre si nécessaire.
+    //-------------------------------------------------------------------------
+    Result      := False;
+    ATextFormat := Nil;
+
+    If Not Assigned(FDWriteFactory) Then
+        Exit;
+
+    If ACanvas.Font.Size > 0 Then
+        LFontSize := ACanvas.Font.Size * 96.0 / 72.0
+    Else If ACanvas.Font.Height <> 0 Then
+        LFontSize := Abs(ACanvas.Font.Height)
+    Else
+        LFontSize := 12.0;
+
+    If fsBold In ACanvas.Font.Style Then
+        LFontWeight := DWRITE_FONT_WEIGHT_BOLD
+    Else
+        LFontWeight := DWRITE_FONT_WEIGHT_NORMAL;
+
+    If fsItalic In ACanvas.Font.Style Then
+        LFontStyle := DWRITE_FONT_STYLE_ITALIC
+    Else
+        LFontStyle := DWRITE_FONT_STYLE_NORMAL;
+
+    LFontName   := ACanvas.Font.Name;
+    LLocaleName := 'fr-FR';
+
+    LResult := FDWriteFactory.CreateTextFormat(
+        PWideChar(LFontName),
+        Nil,
+        LFontWeight,
+        LFontStyle,
+        DWRITE_FONT_STRETCH_NORMAL,
+        LFontSize,
+        PWideChar(LLocaleName),
+        ATextFormat);
+
+    If LResult < 0 Then Begin
+        ATextFormat := Nil;
+        Exit;
+    End;
+
+    If Assigned(ATextFormat) Then
+        ATextFormat.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+
+    Result := Assigned(ATextFormat);
+End;
+
+Function TRotatedEditDirect2DRenderBackend.CreateD2DTextLayout(
+    Const AText: String;
+    ATextFormat: IDWriteTextFormat;
+    AMaxHeight: Single;
+    Out ATextLayout: IDWriteTextLayout): Boolean;
+Var
+    LWideText:  WideString;
+    LMaxHeight: Single;
+    LResult:    HResult;
+Begin
+    //-------------------------------------------------------------------------
+    //Crée un IDWriteTextLayout à partir d'un texte et d'un format.
+    //
+    //Règle d'unicité
+    //---------------
+    //Même principe que CreateD2DTextFormat : source unique pour tous les
+    //consommateurs (rendu, caret, sélection, hit-test), afin que les métriques
+    //soient strictement cohérentes avec le texte affiché.
+    //
+    //LMaxWidth
+    //---------
+    //La largeur maximale est volontairement très grande (100000 px). Le
+    //composant est mono-ligne sans retour à la ligne (DWRITE_WORD_WRAPPING_NO_WRAP
+    //positionné dans CreateD2DTextFormat). Cette valeur évite que DirectWrite
+    //tronque le texte lors de la mesure tout en restant un Single valide.
+    //
+    //AMaxHeight
+    //----------
+    //Le caller passe la hauteur de la zone de contenu canonique, qui doit
+    //être positive. Si elle est nulle ou négative on applique un plancher.
+    //-------------------------------------------------------------------------
+    Result      := False;
+    ATextLayout := Nil;
+
+    If Not Assigned(FDWriteFactory) Then
+        Exit;
+
+    If Not Assigned(ATextFormat) Then
+        Exit;
+
+    LMaxHeight := AMaxHeight;
+
+    If LMaxHeight < 1.0 Then
+        LMaxHeight := 1000.0;
+
+    LWideText := AText;
+
+    LResult := FDWriteFactory.CreateTextLayout(
+        PWideChar(LWideText),
+        Length(LWideText),
+        ATextFormat,
+        100000.0,
+        LMaxHeight,
+        ATextLayout);
+
+    If LResult < 0 Then Begin
+        ATextLayout := Nil;
+        Exit;
+    End;
+
+    Result := Assigned(ATextLayout);
+End;
+
 Function TRotatedEditDirect2DRenderBackend.GetBackendName: String;
 Begin
     Result := Direct2DStateText;
+End;
+
+Function TRotatedEditDirect2DRenderBackend.EnsureCaretVisibleD2D(
+    ACanvas: TCanvas;
+    Const AText: String;
+    ACaretIndex: Integer;
+    ACurrentScrollOffset: Integer;
+    Const ACanonicalContentRect: TRect): Integer;
+Var
+    LTextFormat:    IDWriteTextFormat;
+    LTextLayout:    IDWriteTextLayout;
+    LHitMetrics:    DWRITE_HIT_TEST_METRICS;
+    LCaretX:        Single;
+    LCaretY:        Single;
+    LHResult:       HResult;
+    LIndex:         Integer;
+    LContentWidth:  Integer;
+    LVisibleLeft:   Double;
+    LVisibleRight:  Double;
+    LMargin:        Integer;
+Begin
+    //-------------------------------------------------------------------------
+    //Recalcul du scroll offset avec la position de caret DirectWrite.
+    //
+    //Pourquoi ce recalcul
+    //---------------------
+    //EnsureCaretVisible dans TRotatedEditLayout utilise les métriques GDI
+    //(TextIndexToCanonicalFlow via GetTextExtentExPoint). Quand le backend
+    //Direct2D est actif, le texte est affiché par DirectWrite dont les avances
+    //peuvent différer de celles de GDI (hinting sous-pixel, arrondi de DIP).
+    //La divergence est faible par caractère mais s'accumule : sur 30 caractères,
+    //elle peut dépasser la marge de 2px d'EnsureCaretVisible, ce qui fait que
+    //le caret DirectWrite se retrouve visuellement hors de la zone de contenu
+    //même si le scroll GDI le considère visible.
+    //
+    //Solution : HitTestTextPosition donne la position X du caret dans le repère
+    //du IDWriteTextLayout (départ à x=0). On applique la même logique que
+    //EnsureCaretVisible mais avec cette position DirectWrite, garantissant
+    //la cohérence entre le scroll et le rendu.
+    //
+    //Fallback
+    //--------
+    //Si les ressources DirectWrite ne sont pas disponibles ou si la création
+    //du layout échoue, on conserve le scroll GDI déjà calculé.
+    //-------------------------------------------------------------------------
+    Result := ACurrentScrollOffset;
+
+    If Not Direct2DResourcesAvailable Then
+        Exit;
+
+    If AText = '' Then
+        Exit;
+
+    LIndex := ACaretIndex;
+
+    If LIndex < 0 Then
+        LIndex := 0;
+
+    If LIndex > Length(AText) Then
+        LIndex := Length(AText);
+
+    If Not CreateD2DTextFormat(ACanvas, LTextFormat) Then
+        Exit;
+
+    If Not CreateD2DTextLayout(
+        AText,
+        LTextFormat,
+        Single(ACanonicalContentRect.Height),
+        LTextLayout) Then Begin
+        LTextFormat := Nil;
+        Exit;
+    End;
+
+    LCaretX := 0.0;
+    LCaretY := 0.0;
+    FillChar(LHitMetrics, SizeOf(LHitMetrics), 0);
+
+    LHResult := LTextLayout.HitTestTextPosition(
+        LIndex,
+        False,
+        LCaretX,
+        LCaretY,
+        LHitMetrics);
+
+    LTextLayout := Nil;
+    LTextFormat := Nil;
+
+    If LHResult < 0 Then
+        Exit;
+
+    //Même logique qu'EnsureCaretVisible, mais avec LCaretX DirectWrite.
+    //LCaretX est relatif à l'origine du layout (x=0 = début du texte).
+    //Le scroll est la distance entre le début du texte et le bord gauche
+    //de la zone visible, donc LCaretX joue le même rôle que LCaretFlow dans
+    //EnsureCaretVisible.
+    LMargin       := 2;
+    LContentWidth := ACanonicalContentRect.Width;
+    LVisibleLeft  := Result;
+    LVisibleRight := Result + LContentWidth - (2 * LMargin);
+
+    If LCaretX < LVisibleLeft Then
+        Result := Trunc(LCaretX)
+    Else If LCaretX > LVisibleRight Then
+        Result := Trunc(LCaretX - LContentWidth + (2 * LMargin));
+
+    If Result < 0 Then
+        Result := 0;
 End;
 
 Function TRotatedEditDirect2DRenderBackend.BuildLayout(
     ACanvas: TCanvas;
     Const AInput: TRotatedEditLayoutInput): TRotatedEditLayoutResult;
 Begin
-    Result := FGdiFallback.BuildLayout(
-        ACanvas,
-        AInput);
+    //-------------------------------------------------------------------------
+    //Calcul du layout via le backend GDI, puis correction du scroll en D2D.
+    //
+    //Le layout canonique (positions de texte, de caret, geometrie) est calculé
+    //par le backend GDI car il repose sur des métriques GDI cohérentes avec le
+    //renderer GDI de secours. Seul le scroll offset est ensuite recalibré avec
+    //les métriques DirectWrite quand le chemin D2D est actif.
+    //
+    //Pourquoi ne pas tout recalculer en D2D
+    //---------------------------------------
+    //BuildLayout construit la géométrie canonique complète (quads, origin,
+    //caret, sélection). Ces calculs dépendent de TextIndexToCanonicalFlow qui
+    //est GDI. Remplacer tout le layout par DirectWrite nécessiterait de porter
+    //les métriques D2D dans TRotatedEditLayoutResult, ce qui est une refonte
+    //majeure. La correction du seul scroll offset est suffisante pour que le
+    //caret D2D soit toujours visible après une navigation (HOME, END, flèches).
+    //-------------------------------------------------------------------------
+    Result := FGdiFallback.BuildLayout(ACanvas, AInput);
+
+    //Recalibration du scroll avec les métriques DirectWrite si le chemin D2D
+    //est actif. On utilise AInput.ScrollOffset comme point de départ car
+    //FGdiFallback.BuildLayout a déjà ajusté Result.ScrollOffset selon GDI ;
+    //on recalcule depuis l'offset GDI produit pour ne pas partir d'une valeur
+    //obsolète.
+    If ShouldUseDirect2DContentPath Then Begin
+        Result.ScrollOffset := EnsureCaretVisibleD2D(
+            ACanvas,
+            AInput.Text,
+            AInput.CaretIndex,
+            Result.ScrollOffset,
+            Result.CanonicalContentRect);
+
+        //Recalculer TextOriginCanonical.X et TextOriginActual avec le nouveau
+        //scroll D2D. Si le texte tient dans la zone, le scroll est zéro et
+        //l'alignement est déjà correct (pas de correction nécessaire).
+        If Result.TextLength > Result.CanonicalContentRect.Width Then Begin
+            Result.TextOriginCanonical.X :=
+                Result.CanonicalContentRect.Left - Result.ScrollOffset;
+
+            //TextOriginActual doit rester cohérent avec TextOriginCanonical.
+            Result.TextOriginActual := TRotatedEditGeometry.TransformPoint(
+                Result.TextOriginCanonical,
+                Result.ActualOrigin,
+                Result.Angle);
+        End;
+    End;
 End;
 
 Function TRotatedEditDirect2DRenderBackend.HitTest(
     ACanvas: TCanvas;
     Const ALayout: TRotatedEditLayoutResult;
     Const AActualPoint: TPoint): TRotatedEditHitTestResult;
+Var
+    LActual:         TRotatedEditFloatPoint;
+    LCanonical:      TRotatedEditFloatPoint;
+    LRelX:           Single;
+    LRelY:           Single;
+    LIsTrailingHit:  BOOL;
+    LIsInside:       BOOL;
+    LHitMetrics:     DWRITE_HIT_TEST_METRICS;
+    LTextFormat:     IDWriteTextFormat;
+    LTextLayout:     IDWriteTextLayout;
+    LHResult:        HResult;
+    LInsertionIndex: Integer;
+    LMaxHeight:      Single;
 Begin
-    Result := FGdiFallback.HitTest(
-        ACanvas,
-        ALayout,
-        AActualPoint);
+    //-------------------------------------------------------------------------
+    //Hit-test souris via DirectWrite — cohérence métrique avec le rendu.
+    //
+    //Problème résolu
+    //---------------
+    //Quand le backend Direct2D est actif, le texte est affiché par DirectWrite.
+    //L'ancienne implémentation déléguait le hit-test au backend GDI, qui
+    //mesurait les positions de caractères via GetTextExtentPoint32. Les avances
+    //GDI et DirectWrite divergent légèrement (crénage, hinting, sous-pixels) ;
+    //l'écart s'accumule caractère par caractère et provoque un drift croissant
+    //entre la position cliquée et l'index de caret calculé.
+    //
+    //Solution
+    //--------
+    //On utilise IDWriteTextLayout.HitTestPoint, qui opère sur le même objet
+    //de layout que celui utilisé pour dessiner le texte et positionner le caret.
+    //Les métriques sont donc garanties cohérentes avec l'affichage.
+    //
+    //Coordonnées relatives
+    //---------------------
+    //HitTestPoint attend des coordonnées relatives à l'origine du layout
+    //DirectWrite, soit (TextOriginCanonical.X, TextOriginCanonical.Y).
+    //On projette d'abord le point écran → canonique via InverseTransformPoint,
+    //puis on soustrait l'origine du texte.
+    //
+    //Trailing hit → index d'insertion
+    //---------------------------------
+    //DirectWrite retourne isTrailingHit=True quand le clic est dans la moitié
+    //droite d'un glyphe. Dans ce cas l'index d'insertion est textPosition+1,
+    //ce qui correspond au comportement d'un TEdit natif Windows.
+    //
+    //Fallback GDI
+    //------------
+    //Si Direct2D n'est pas disponible ou si la création du layout échoue,
+    //on délègue au backend GDI pour garantir un comportement dégradé cohérent.
+    //-------------------------------------------------------------------------
+
+    //Fallback GDI si le chemin Direct2D n'est pas actif
+    If Not ShouldUseDirect2DContentPath Then Begin
+        Result := FGdiFallback.HitTest(ACanvas, ALayout, AActualPoint);
+        Exit;
+    End;
+
+    Result.ActualPoint := AActualPoint;
+
+    //1. Projection écran → canonique (même règle que TRotatedEditLayout.HitTest)
+    LActual := TRotatedEditFloatPoint.Create(AActualPoint.X, AActualPoint.Y);
+
+    LCanonical := TRotatedEditGeometry.InverseTransformPoint(
+        LActual,
+        ALayout.ActualOrigin,
+        ALayout.Angle);
+
+    Result.CanonicalPoint := LCanonical;
+
+    Result.InTextBand :=
+        (LCanonical.Y >= ALayout.TextOriginCanonical.Y) And
+        (LCanonical.Y <= ALayout.TextOriginCanonical.Y + ALayout.TextThickness);
+
+    //2. Coordonnées relatives à l'origine du layout DirectWrite
+    //   HitTestPoint opère dans le repère du IDWriteTextLayout, dont l'origine
+    //   correspond à TextOriginCanonical dans notre système canonique.
+    LRelX := Single(LCanonical.X - ALayout.TextOriginCanonical.X);
+    LRelY := Single(LCanonical.Y - ALayout.TextOriginCanonical.Y);
+
+    //Les coordonnées négatives signifient un clic avant le début du texte :
+    //on clampte à zéro pour que DirectWrite retourne l'index 0.
+    If LRelX < 0.0 Then
+        LRelX := 0.0;
+
+    If LRelY < 0.0 Then
+        LRelY := 0.0;
+
+    //3. Création du layout DirectWrite avec le même format que le rendu
+    LMaxHeight := Single(ALayout.CanonicalContentRect.Height);
+
+    If Not CreateD2DTextFormat(ACanvas, LTextFormat) Then Begin
+        Result := FGdiFallback.HitTest(ACanvas, ALayout, AActualPoint);
+        Exit;
+    End;
+
+    If Not CreateD2DTextLayout(
+        ALayout.Text,
+        LTextFormat,
+        LMaxHeight,
+        LTextLayout) Then Begin
+        LTextFormat := Nil;
+        Result := FGdiFallback.HitTest(ACanvas, ALayout, AActualPoint);
+        Exit;
+    End;
+
+    //4. Hit-test DirectWrite natif
+    LIsTrailingHit := False;
+    LIsInside      := False;
+    FillChar(LHitMetrics, SizeOf(LHitMetrics), 0);
+
+    LHResult := LTextLayout.HitTestPoint(
+        LRelX,
+        LRelY,
+        LIsTrailingHit,
+        LIsInside,
+        LHitMetrics);
+
+    LTextLayout := Nil;
+    LTextFormat := Nil;
+
+    If LHResult < 0 Then Begin
+        //Échec DirectWrite : repli GDI
+        Result := FGdiFallback.HitTest(ACanvas, ALayout, AActualPoint);
+        Exit;
+    End;
+
+    //5. Conversion trailing hit → index d'insertion (comportement TEdit natif)
+    //   textPosition est l'index du caractère touché (0-based).
+    //   Si isTrailingHit, le clic est dans la moitié droite : le caret se place
+    //   après ce caractère, donc index = textPosition + 1.
+    LInsertionIndex := Integer(LHitMetrics.textPosition);
+
+    If LIsTrailingHit Then
+        Inc(LInsertionIndex);
+
+    //Clamp défensif
+    If LInsertionIndex < 0 Then
+        LInsertionIndex := 0;
+
+    If LInsertionIndex > Length(ALayout.Text) Then
+        LInsertionIndex := Length(ALayout.Text);
+
+    Result.InsertionIndex := LInsertionIndex;
 End;
 
 Procedure TRotatedEditDirect2DRenderBackend.DrawContent(
@@ -1833,89 +2218,20 @@ Var
     End;
 
     Function CreateTextFormat(Var ATextFormat: IDWriteTextFormat): Boolean;
-    Var
-        LFontName: WideString;
-        LLocaleName: WideString;
-        LResultLocal: HResult;
     Begin
-        Result := False;
-        ATextFormat := Nil;
-
-        If Not Assigned(FDWriteFactory) Then
-            Exit;
-
-        LFontName := ACanvas.Font.Name;
-        LLocaleName := 'fr-FR';
-
-        LResultLocal := FDWriteFactory.CreateTextFormat(
-            PWideChar(LFontName),
-            Nil,
-            ResolveDWriteFontWeight,
-            ResolveDWriteFontStyle,
-            DWRITE_FONT_STRETCH_NORMAL,
-            ResolveDWriteFontSize,
-            PWideChar(LLocaleName),
-            ATextFormat);
-
-        If LResultLocal < 0 Then
-        Begin
-            FD2DState.RenderState := rddsRenderFailed;
-            FD2DState.LastNativeError := LResultLocal;
-            ATextFormat := Nil;
-            Exit;
-        End;
-
-        If Assigned(ATextFormat) Then
-            ATextFormat.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
-
-        Result := Assigned(ATextFormat);
+        //Délègue à la méthode de classe — source unique du format DirectWrite.
+        Result := CreateD2DTextFormat(ACanvas, ATextFormat);
     End;
 
     Function CreateTextLayout(
         ATextFormat: IDWriteTextFormat;
         Var ATextLayout: IDWriteTextLayout): Boolean;
     Var
-        LWideText: WideString;
-        LResultLocal: HResult;
-        LMaxWidth: Single;
         LMaxHeight: Single;
     Begin
-        Result := False;
-        ATextLayout := Nil;
-
-        If Not Assigned(FDWriteFactory) Then
-            Exit;
-
-        If Not Assigned(ATextFormat) Then
-            Exit;
-
-        LWideText := ALayout.Text;
-        LMaxWidth := 100000.0;
+        //Délègue à la méthode de classe — source unique du layout DirectWrite.
         LMaxHeight := Single(ALayout.CanonicalContentRect.Height);
-
-        If LMaxHeight < 1.0 Then
-            LMaxHeight := Single(ALayout.LogicalThickness);
-
-        If LMaxHeight < 1.0 Then
-            LMaxHeight := 1000.0;
-
-        LResultLocal := FDWriteFactory.CreateTextLayout(
-            PWideChar(LWideText),
-            Length(LWideText),
-            ATextFormat,
-            LMaxWidth,
-            LMaxHeight,
-            ATextLayout);
-
-        If LResultLocal < 0 Then
-        Begin
-            FD2DState.RenderState := rddsRenderFailed;
-            FD2DState.LastNativeError := LResultLocal;
-            ATextLayout := Nil;
-            Exit;
-        End;
-
-        Result := Assigned(ATextLayout);
+        Result := CreateD2DTextLayout(ALayout.Text, ATextFormat, LMaxHeight, ATextLayout);
     End;
 Begin
     //--------------------------------------------------------------------------

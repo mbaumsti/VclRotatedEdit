@@ -2654,11 +2654,29 @@ End;
 
 Procedure TRotatedEditCore.SetSelStart(Const Value: Integer);
 Var
-    LOldSelStart: Integer;
-    LOldSelLength: Integer;
+    LOldSelStart:   Integer;
+    LOldSelLength:  Integer;
+    LOldCaretIndex: Integer;
 Begin
-    LOldSelStart := FSelStart;
-    LOldSelLength := FSelLength;
+    //-------------------------------------------------------------------------
+    //Alignement CaretIndex / SelStart — comportement TEdit natif.
+    //
+    //Un TEdit natif Windows déplace le caret lorsqu'on écrit SelStart.
+    //Quand SelLength vaut 0 (pas de sélection active), le caret se trouve
+    //toujours à SelStart. Cette règle doit être respectée ici pour que tout
+    //code tiers qui positionne le caret via SelStart (idiome classique) obtienne
+    //le comportement attendu.
+    //
+    //Règle appliquée :
+    //- SelStart est normalisé dans [0, Length(Text)].
+    //- Si SelLength = 0 après la mise à jour, le caret et l'ancre de sélection
+    //  sont déplacés sur SelStart, exactement comme le fait SetCaretAndSelection.
+    //- Si SelLength > 0, le caret n'est pas modifié : l'appelant gère une
+    //  sélection programmatique et positionne SelLength séparément.
+    //-------------------------------------------------------------------------
+    LOldSelStart   := FSelStart;
+    LOldSelLength  := FSelLength;
+    LOldCaretIndex := FCaretIndex;
 
     FSelStart := Value;
 
@@ -2671,9 +2689,18 @@ Begin
     If FSelStart + FSelLength > Length(FText) Then
         FSelLength := Length(FText) - FSelStart;
 
+    //Aligner le caret sur SelStart quand il n'y a pas de sélection active
+    If FSelLength = 0 Then Begin
+        FCaretIndex      := FSelStart;
+        FSelectionAnchor := FSelStart;
+    End;
+
     If (LOldSelStart <> FSelStart) Or
        (LOldSelLength <> FSelLength) Then
         SelectionChanged;
+
+    If LOldCaretIndex <> FCaretIndex Then
+        FCaretController.ResetBlink;
 
     InvalidateContentBitmap;
     Invalidate;
@@ -5131,16 +5158,21 @@ End;
 Function TRotatedEditCore.IsWordChar(AChar: Char): Boolean;
 Begin
     //-------------------------------------------------------------------------
-    //Defines the V1 word-selection rule.
+    //Détermine si un caractère fait partie d'un mot pour la sélection par
+    //double-clic.
     //
-    //A word is currently an ASCII identifier-like sequence:
-    //letters, digits or underscore.
+    //Règle alignée sur TEdit natif Windows
+    //--------------------------------------
+    //Un TEdit Windows utilise IsCharAlphaNumeric (API Win32) qui délègue à la
+    //locale système. Cette fonction reconnaît les lettres accentuées (é, à, ü,
+    //ç, ñ, etc.) comme des lettres valides selon la langue active, exactement
+    //comme le ferait un double-clic dans un champ texte natif.
     //
-    //This rule is intentionally simple and predictable. Unicode word breaking
-    //can be introduced later without changing the double-click selection
-    //contract.
+    //L'underscore est ajouté séparément car IsCharAlphaNumeric ne le considère
+    //pas comme alphanumérique, mais les éditeurs de texte courants l'incluent
+    //dans les mots (noms de variables, identifiants).
     //-------------------------------------------------------------------------
-    Result := (AChar >= 'A') And (AChar <= 'Z') Or (AChar >= 'a') And (AChar <= 'z') Or (AChar >= '0') And (AChar <= '9') Or (AChar = '_');
+    Result := IsCharAlphaNumeric(AChar) Or (AChar = '_');
 End;
 
 Function TRotatedEditCore.FindWordStart(ACharIndex: Integer): Integer;
@@ -5329,27 +5361,34 @@ End;
 
 Procedure TRotatedEditCore.SelectWordAt(AIndex: Integer);
 Var
-    LIndex:     Integer;
-    LCharIndex: Integer;
-    LStartChar: Integer;
-    LEndChar:   Integer;
+    LIndex:         Integer;
+    LCharIndex:     Integer;
+    LStartChar:     Integer;
+    LEndChar:       Integer;
     LOldCaretIndex: Integer;
-    LOldSelStart: Integer;
-    LOldSelLength: Integer;
+    LOldSelStart:   Integer;
+    LOldSelLength:  Integer;
 Begin
     //-------------------------------------------------------------------------
-    //Selects the word under a caret insertion index.
+    //Sélectionne le mot sous l'index de caret donné.
     //
-    //Hit-testing returns insertion indexes, not character indexes. If the caret
-    //is before a word character, that character is used. If it is after a word
-    //character, the previous character is used.
+    //Indexes
+    //-------
+    //FindWordStart/End retournent des index 1-based de caractère.
+    //FSelStart / FCaretIndex / FSelectionAnchor sont des insertion indexes
+    //0-based (position du caret entre les caractères).
+    //Donc FSelStart = LStartChar - 1, FCaretIndex = LEndChar - 1.
     //
-    //If no adjacent word character exists, the selection is cleared at the
-    //clicked caret position.
+    //Scroll
+    //------
+    //Le scroll n'est pas modifié ici. EnsureSelectionVisible (appelé via
+    //BuildCurrentLayout dans Paint) se charge d'ajuster le scroll uniquement
+    //si le caret ou l'ancre sont hors de la zone visible. Si les deux
+    //extrémités du mot sont déjà visibles, le scroll reste inchangé.
     //-------------------------------------------------------------------------
     LOldCaretIndex := FCaretIndex;
-    LOldSelStart := FSelStart;
-    LOldSelLength := FSelLength;
+    LOldSelStart   := FSelStart;
+    LOldSelLength  := FSelLength;
 
     LIndex := NormalizeTextIndex(AIndex);
     LCharIndex := 0;
@@ -5360,19 +5399,17 @@ Begin
         LCharIndex := LIndex;
 
     If LCharIndex = 0 Then Begin
-        SetCaretAndSelection(
-            LIndex,
-            False);
+        SetCaretAndSelection(LIndex, False);
         Exit;
     End;
 
     LStartChar := FindWordStart(LCharIndex);
-    LEndChar := FindWordEnd(LCharIndex);
+    LEndChar   := FindWordEnd(LCharIndex);
 
     FSelectionAnchor := LStartChar - 1;
-    FCaretIndex := LEndChar - 1;
-    FSelStart := LStartChar - 1;
-    FSelLength := LEndChar - LStartChar;
+    FCaretIndex      := LEndChar - 1;
+    FSelStart        := LStartChar - 1;
+    FSelLength       := LEndChar - LStartChar;
 
     If (LOldCaretIndex <> FCaretIndex) Or
        (LOldSelStart <> FSelStart) Or

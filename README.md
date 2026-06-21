@@ -330,6 +330,80 @@ If your PasDoc version does not support `@` response files, use the fallback com
 
 ---
 
+## Version history
+
+### v1.1.2 — 2026-06-21
+
+Bug-fix release. No API changes. All fixes apply to both GDI and Direct2D backends unless noted.
+
+**GDI — selection performance on long text**
+
+Mouse selection and caret movement on long strings were slow because
+`BuildTextAdvances` measured each text prefix individually with
+`GetTextExtentPoint32`, producing O(n²) GDI calls. The method now uses
+`GetTextExtentExPoint`, which fills the complete cumulative-width table in a
+single kernel call (O(n)). The DC state (rotation-safe font, world transform)
+is identical to the previous implementation, so measured positions are
+unchanged.
+
+**Direct2D — caret position drift on long text**
+
+The caret and mouse hit-test used GDI metrics (cumulative prefix widths) while
+the text was rendered by DirectWrite. Because GDI and DirectWrite advance widths
+diverge slightly, the error accumulated character by character and became
+visible on long strings — the caret drifted progressively away from the
+insertion point.
+
+Fixes:
+
+- `HitTest` in the Direct2D backend now uses `IDWriteTextLayout.HitTestPoint`
+  instead of delegating to the GDI fallback. The insertion index is therefore
+  derived from the same DirectWrite layout object that rendered the text.
+- `BuildLayout` in the Direct2D backend recalibrates `ScrollOffset` using
+  `IDWriteTextLayout.HitTestTextPosition` after the GDI layout pass, so that
+  navigation keys (Home, End, arrows) always bring the caret into the visible
+  area under DirectWrite metrics.
+- `CreateD2DTextFormat` and `CreateD2DTextLayout` are now private class methods
+  shared by the renderer, caret, selection and hit-test paths. This guarantees
+  that all four consumers use the identical DirectWrite format and layout object.
+
+**Direct2D — End key did not scroll to end on long text**
+
+Pressing End on a text longer than the control width did not scroll the view
+to reveal the caret when the Direct2D backend was active. The root cause was
+the metric divergence described above: the GDI-based `EnsureCaretVisible`
+computed a scroll offset that kept the GDI caret in view, but the DirectWrite
+caret ended up just outside the visible area. The `EnsureCaretVisibleD2D`
+correction described above resolves this.
+
+**Both backends — double-click scrolled the view unnecessarily**
+
+Double-clicking a word that was already fully visible could scroll the text,
+making it appear that the wrong word had been selected. The fix introduces
+`EnsureSelectionVisible` in `TRotatedEditLayout`, which replaces the previous
+`EnsureCaretVisible` call in `BuildLayout`. The new method checks both
+endpoints of the selection: if both the caret and the selection anchor are
+already inside the visible window, the scroll offset is left unchanged. The
+caret takes priority if only one endpoint is outside.
+
+**Both backends — `SelStart` did not move the caret**
+
+Assigning `SelStart` programmatically (the classical `SelStart := N` idiom
+used to position the caret) did not move the visible caret when `SelLength`
+was zero. `SetSelStart` now aligns `FCaretIndex` and `FSelectionAnchor` with
+`FSelStart` whenever `SelLength = 0`, matching the behavior of a native
+`TEdit`.
+
+**Both backends — accented characters treated as word separators on double-click**
+
+`IsWordChar` used an ASCII range test (`'A'..'Z'`, `'a'..'z'`, `'0'..'9'`),
+which treated all accented letters (é, à, ü, ç, ñ, …) as delimiters. The
+function now calls `IsCharAlphaNumeric` (Win32 API), which is locale-aware and
+Unicode-compatible — the same function used internally by the native Windows
+edit control.
+
+---
+
 ## Current development state
 
 The source tree currently contains two rendering backends:

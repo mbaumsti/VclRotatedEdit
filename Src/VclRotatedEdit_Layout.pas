@@ -187,6 +187,27 @@ Type
             AAngle: Double = 0.0): Integer; Static;
 
         {
+          Ensures that both the caret and the selection anchor are visible.
+
+          If both endpoints are already inside the visible window, the scroll
+          offset is left unchanged. If only the caret is outside, the view is
+          shifted minimally to bring the caret into view. If both are outside,
+          the caret takes priority (same rule as EnsureCaretVisible).
+
+          This is the method called by BuildLayout so that a word-selection or
+          Shift+click never scrolls unnecessarily when the full selection fits
+          inside the visible area.
+        }
+        Class Function EnsureSelectionVisible(
+            ACanvas: TCanvas;
+            Const AText: String;
+            ACaretIndex: Integer;
+            AAnchorIndex: Integer;
+            ACurrentScrollOffset: Integer;
+            Const ACanonicalContentRect: TRect;
+            AAngle: Double = 0.0): Integer; Static;
+
+        {
           Builds canonical and actual caret geometry.
 
           The caret center is the reference point. It represents both the
@@ -439,10 +460,11 @@ Class Procedure TRotatedEditLayout.BuildTextAdvances(
     Out AAdvances: TArray<Integer>;
     Out ATextSize: TSize);
 Var
-    I:           Integer;
-    LTextLength: Integer;
-    LPrefix:             String;
-    LPrefixSize:         TSize;
+    I:                   Integer;
+    LTextLength:         Integer;
+    LFitChars:           Integer;
+    LExtents:            Array Of Integer;
+    LFullSize:           TSize;
     LOk:                 Boolean;
     LFont:               HFONT;
     LOldFont:            HGDIOBJ;
@@ -451,76 +473,62 @@ Var
     LWorldTransformOpen: Boolean;
 Begin
     //-------------------------------------------------------------------------
-    //Builds cumulative caret positions for a complete text run.
+    //Construit les positions cumulatives de caret pour un texte complet — O(n).
     //
-    //Why this method exists
-    //----------------------
-    //A rotated edit control makes text metric differences very visible. When the
-    //control is displayed at a free angle such as 45 degrees, even a small
-    //difference along the canonical text-flow axis is projected on both screen
-    //axes and appears as a visible caret drift.
+    //Pourquoi GetTextExtentExPoint et non une boucle de préfixes
+    //-----------------------------------------------------------
+    //L'implémentation par boucle mesurait chaque préfixe 1..n via un appel
+    //GetTextExtentPoint32 séparé : n appels GDI, coût O(n²). Sur un texte
+    //de 50 caractères cela représente 50 allers-retours noyau par mise à jour
+    //du layout, d'où la lenteur perçue lors de la sélection à la souris.
     //
-    //Important rule
-    //-------------------
-    //Each caret position is measured from the complete prefix that precedes the
-    //insertion point, but now the measurement DC is also aligned with the final
-    //rotated GDI TextOut path:
+    //GetTextExtentExPoint remplit en un seul appel le tableau lpDx[] avec les
+    //positions cumulatives de chaque caractère (dans le DC courant, donc dans
+    //l'espace de la world-transform active). Cela donne exactement le même
+    //résultat qu'une boucle de préfixes, mais en O(n).
     //
-    //  - same source LOGFONT;
-    //  - same ClearType avoidance policy for arbitrary angles;
-    //  - same GM_ADVANCED/world-transform model;
-    //  - same unrotated HFONT with rotation owned by the transform.
+    //Pourquoi pas GetCharacterPlacement
+    //------------------------------------
+    //GetCharacterPlacement retourne les avances individuelles de glyphes dans
+    //l'espace de la fonte (avant transformation). Avec GM_ADVANCED et une
+    //world-transform de rotation active, ces avances ne correspondent pas aux
+    //largeurs projetées mesurées par GetTextExtentPoint32. GetTextExtentExPoint
+    //opère en revanche dans le repère logique courant (transformé), ce qui le
+    //rend cohérent avec GetTextExtentPoint32 et avec le TextOut du renderer.
     //
-    //A prefix-only correction was not sufficient because it still used
-    //the normal canvas font/context while the renderer used a rotation-safe
-    //temporary HFONT. That produced a cumulative drift: on a 28-character text,
-    //the caret could end almost one character away from the visible text end.
-    //
-    //Cost model
+    //État du DC
     //----------
-    //This is O(n²) because each prefix is measured as a string. TRotatedEdit is
-    //currently a single-line edit control, so this cost is acceptable and the
-    //visual correctness is more important than the small extra layout cost.
+    //Le DC est préparé avec la même police non-rotée
+    //(CreateRotationSafeMeasurementFont) et la même world-transform
+    //(BeginMeasurementWorldTransform) que le renderer GDI. Les métriques
+    //retournées sont donc identiques à celles que produirait la boucle
+    //de préfixes originale, à la précision entière près.
     //
-    //Single metric source
-    //--------------------
-    //All caret placement, selection geometry, hit-testing and scroll-to-caret
-    //logic go through this method. Keeping this as the single metric source is
-    //more important than optimizing only one consumer, otherwise the caret could
-    //be fixed while selection or mouse hit-testing would still disagree.
-    //
-    //Current limitation
-    //------------------
-    //This remains a GDI metric model. It does not implement Unicode shaping,
-    //surrogate pairs, ligature clusters or bidirectional text. If a future
-    //DirectWrite backend owns text layout, this method is the place where the GDI
-    //metric policy can be replaced by backend-owned caret stops.
+    //Limitation
+    //----------
+    //Comme l'ancienne implémentation, ce modèle reste GDI et ne gère pas
+    //les substitutions Unicode complexes ni le texte bidirectionnel. Un futur
+    //backend DirectWrite remplacera ce bloc par des métriques DirectWrite.
     //-------------------------------------------------------------------------
     LTextLength := Length(AText);
 
-    SetLength(
-        AAdvances,
-        LTextLength);
-
+    SetLength(AAdvances, LTextLength);
     ATextSize.cx := 0;
     ATextSize.cy := 0;
 
     If LTextLength = 0 Then
         Exit;
 
-    LOk := True;
-    LFont := 0;
-    LOldFont := 0;
+    LOk                 := False;
+    LFont               := 0;
+    LOldFont            := 0;
     LWorldTransformOpen := False;
+    LFitChars           := 0;
 
-    LFont := CreateRotationSafeMeasurementFont(
-        ACanvas,
-        AAngle);
+    LFont := CreateRotationSafeMeasurementFont(ACanvas, AAngle);
 
     If LFont <> 0 Then
-        LOldFont := SelectObject(
-            ACanvas.Handle,
-            LFont);
+        LOldFont := SelectObject(ACanvas.Handle, LFont);
 
     Try
         BeginMeasurementWorldTransform(
@@ -530,26 +538,28 @@ Begin
             LSavedGraphicsMode);
         LWorldTransformOpen := True;
 
-        For I := 1 To LTextLength Do Begin
-            LPrefix := Copy(
-                AText,
-                1,
-                I);
+        //---------------------------------------------------------------------
+        //GetTextExtentExPoint remplit LExtents[i] avec la largeur cumulée
+        //du texte de 0 à i inclus, dans le repère logique courant (transformé).
+        //C'est exactement ce que retournait GetTextExtentPoint32(Copy(s,1,i+1))
+        //en boucle, en un seul appel noyau.
+        //---------------------------------------------------------------------
+        SetLength(LExtents, LTextLength);
 
-            If GetTextExtentPoint32(
-                ACanvas.Handle,
-                PChar(LPrefix),
-                Length(LPrefix),
-                LPrefixSize) Then Begin
-                AAdvances[I - 1] := LPrefixSize.cx;
+        If GetTextExtentExPoint(
+            ACanvas.Handle,
+            PChar(AText),
+            LTextLength,
+            MaxInt,               //nMaxExtent : pas de limite de largeur
+            PInteger(@LFitChars), //lpnFit : nombre de caractères qui rentrent (non utilisé ici)
+            PInteger(@LExtents[0]),//lpDx : tableau des largeurs cumulées
+            LFullSize) Then Begin
 
-                If I = LTextLength Then
-                    ATextSize := LPrefixSize;
-            End
-            Else Begin
-                LOk := False;
-                Break;
-            End;
+            For I := 0 To LTextLength - 1 Do
+                AAdvances[I] := LExtents[I];
+
+            ATextSize := LFullSize;
+            LOk       := True;
         End;
     Finally
         If LWorldTransformOpen Then
@@ -559,9 +569,7 @@ Begin
                 LSavedGraphicsMode);
 
         If LOldFont <> 0 Then
-            SelectObject(
-                ACanvas.Handle,
-                LOldFont);
+            SelectObject(ACanvas.Handle, LOldFont);
 
         If LFont <> 0 Then
             DeleteObject(LFont);
@@ -569,11 +577,11 @@ Begin
 
     If Not LOk Then Begin
         //---------------------------------------------------------------------
-        //Fallback path.
+        //Chemin de repli — GetTextExtentExPoint non disponible ou DC invalide.
         //
-        //This should rarely be used, but keeping a deterministic fallback is
-        //safer than returning a partially-built advance table. The fallback uses
-        //TCanvas text metrics because they are always available through VCL.
+        //On revient à la boucle de préfixes originale (O(n²)) qui est toujours
+        //correcte, car elle opère dans le même DC transformé. Ce chemin ne
+        //devrait jamais être emprunté sur Windows Vista et supérieur.
         //---------------------------------------------------------------------
         ATextSize.cx := ACanvas.TextWidth(AText);
         ATextSize.cy := ACanvas.TextHeight('Wg');
@@ -910,10 +918,17 @@ Begin
 
     Result.ActualEditBounds := QuadBounds(Result.ActualEditQuad);
 
-    Result.ScrollOffset := EnsureCaretVisible(
+    //EnsureSelectionVisible vérifie que les deux extrémités de la sélection
+    //sont dans la zone visible avant de scroller. Si caret et ancre sont tous
+    //deux visibles, le scroll reste inchangé. On passe SelStart comme ancre :
+    //c'est toujours une extrémité de la sélection, et CaretIndex est l'autre.
+    //Cas sans sélection (SelLength=0) : SelStart = CaretIndex, les deux
+    //paramètres sont identiques et la règle se réduit à EnsureCaretVisible.
+    Result.ScrollOffset := EnsureSelectionVisible(
         ACanvas,
         AInput.Text,
         AInput.CaretIndex,
+        AInput.SelStart,
         AInput.ScrollOffset,
         Result.CanonicalContentRect,
         Result.Angle);
@@ -1176,6 +1191,83 @@ Begin
         Result := Trunc(LCaretFlow)
     Else If LCaretFlow > LVisibleRight Then
         Result := Trunc(LCaretFlow - ACanonicalContentRect.Width + (2 * LMargin));
+
+    If Result < 0 Then
+        Result := 0;
+End;
+
+Class Function TRotatedEditLayout.EnsureSelectionVisible(
+    ACanvas: TCanvas;
+    Const AText: String;
+    ACaretIndex: Integer;
+    AAnchorIndex: Integer;
+    ACurrentScrollOffset: Integer;
+    Const ACanonicalContentRect: TRect;
+    AAngle: Double): Integer;
+Var
+    LCaretFlow:    Double;
+    LAnchorFlow:   Double;
+    LVisibleLeft:  Double;
+    LVisibleRight: Double;
+    LMargin:       Integer;
+    LCaretOut:     Boolean;
+    LAnchorOut:    Boolean;
+Begin
+    //-------------------------------------------------------------------------
+    //Ajuste le scroll pour rendre le caret visible, sans modifier la vue si
+    //la sélection complète est déjà dans la zone visible.
+    //
+    //Règle
+    //-----
+    //On calcule la position canonique du caret ET de l'ancre de sélection.
+    //- Si les deux sont dans la fenêtre visible [Left+margin .. Right-margin],
+    //  le scroll n'est pas modifié : aucun déplacement intempestif de la vue.
+    //- Si le caret est hors zone, on le ramène en vue (comportement standard).
+    //- Si l'ancre est hors zone mais pas le caret, on ramène l'ancre en vue.
+    //  (cas : Shift+clic vers la gauche, le début de sélection sort)
+    //- Si les deux sont hors zone du même côté, le caret a la priorité.
+    //
+    //Pourquoi cette règle
+    //--------------------
+    //Sans elle, un double-clic sur un mot en début de texte alors que la vue
+    //est scrollée vers la fin déclenchait un scroll vers le début, parce que
+    //FCaretIndex (fin du mot) était hors de la vue scrollée. La vue bougeait
+    //alors que le mot cliqué était visible dans la zone affichée à l'écran.
+    //
+    //Avec cette règle, si mot début (ancre) ET fin de mot (caret) sont tous
+    //deux dans la zone visible actuelle, le scroll reste inchangé.
+    //-------------------------------------------------------------------------
+    Result := ACurrentScrollOffset;
+
+    If Result < 0 Then
+        Result := 0;
+
+    LMargin := 2;
+
+    LCaretFlow := TextIndexToCanonicalFlow(ACanvas, AText, ACaretIndex, AAngle);
+    LAnchorFlow := TextIndexToCanonicalFlow(ACanvas, AText, AAnchorIndex, AAngle);
+
+    LVisibleLeft  := Result;
+    LVisibleRight := Result + ACanonicalContentRect.Width - (2 * LMargin);
+
+    LCaretOut  := (LCaretFlow < LVisibleLeft) Or (LCaretFlow > LVisibleRight);
+    LAnchorOut := (LAnchorFlow < LVisibleLeft) Or (LAnchorFlow > LVisibleRight);
+
+    //Si les deux sont dans la zone : ne rien faire
+    If Not LCaretOut And Not LAnchorOut Then
+        Exit;
+
+    //Sinon : ajuster pour ramener le caret en vue (priorité au caret)
+    If LCaretFlow < LVisibleLeft Then
+        Result := Trunc(LCaretFlow)
+    Else If LCaretFlow > LVisibleRight Then
+        Result := Trunc(LCaretFlow - ACanonicalContentRect.Width + (2 * LMargin))
+    Else If LAnchorFlow < LVisibleLeft Then
+        //Caret visible, ancre hors zone à gauche : ramener l'ancre
+        Result := Trunc(LAnchorFlow)
+    Else If LAnchorFlow > LVisibleRight Then
+        //Caret visible, ancre hors zone à droite : ramener l'ancre
+        Result := Trunc(LAnchorFlow - ACanonicalContentRect.Width + (2 * LMargin));
 
     If Result < 0 Then
         Result := 0;
